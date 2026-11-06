@@ -1,0 +1,219 @@
+name: Full UI ROM Porter (joyeuse / miatoll - EROFS + uclamp)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_name:
+        description: "اسم الروم/الواجهة (مثال: HyperOS-2.0 أو OxygenOS-16 أو Lunaris-3.13)"
+        required: true
+        default: "OEM-Port"
+        type: string
+      base_rom_url:
+        description: "رابط الروم الأساسي لهاتف miatoll/joyeuse (لأخذ تعريفات العتاد Vendor/Boot)"
+        required: true
+        default: ""
+        type: string
+      port_rom_url:
+        description: "رابط روم الواجهة الكاملة المراد سحب النظام منها (Port ROM URL)"
+        required: true
+        default: ""
+        type: string
+      ui_type:
+        description: "نوع الواجهة المراد عمل بورت لها"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - hyperos
+          - oplus
+          - nothingos
+          - aosp
+      kernel_mode:
+        description: "وضع معالجة الكيرنل (EROFS + uclamp)"
+        required: true
+        default: "compile_nexusbase"
+        type: choice
+        options:
+          - compile_nexusbase
+          - custom_url
+          - keep_base
+      custom_kernel_url:
+        description: "رابط الكيرنل الخارجي AnyKernel3 .zip أو boot.img (فقط إذا اخترت custom_url)"
+        required: false
+        default: ""
+        type: string
+      enable_debloat:
+        description: "حذف التطبيقات الزائدة والإعلانية لتناسب مساحة super (8GB)"
+        required: false
+        default: true
+        type: boolean
+      enable_adb_debug:
+        description: "تفعيل USB ADB مبكراً أثناء الإقلاع لتسهيل سحب سجلات logcat"
+        required: false
+        default: true
+        type: boolean
+      disable_dfe:
+        description: "تعطيل تشفير البيانات التلقائي (Disable Force Encryption)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  PORT_WORKDIR: "/home/runner/port_workspace"
+
+jobs:
+  port-rom:
+    name: Port Full UI ROM (joyeuse / miatoll)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: استنساخ مطبخ البورت (Checkout Porting Kitchen)
+        uses: actions/checkout@v4
+
+      - name: تفريغ المساحة وتوفير 100+ جيجابايت (Disk Space Cleanup)
+        run: |
+          echo "=== المساحة قبل التنظيف ==="
+          df -h /
+
+          sudo docker image prune --all --force || true
+          sudo docker system prune --all --volumes --force || true
+          sudo systemctl stop docker docker.socket containerd || true
+
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /var/lib/docker \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/lib/node_modules \
+            /usr/share/swift \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /opt/az \
+            "$AGENT_TOOLSDIRECTORY" || true
+
+          sudo apt-get clean
+          sudo journalctl --vacuum-time=1s || true
+
+          echo "=== المساحة بعد التنظيف ==="
+          df -h /
+
+      - name: تثبيت وتجهيز أدوات البورت (Setup Porting Tools)
+        run: |
+          chmod +x porting/*.sh porting/*.py
+          ./porting/setup_tools.sh
+
+      - name: تحميل وفك الروم الأساسي (Download & Unpack Base ROM - miatoll)
+        env:
+          BASE_URL: ${{ inputs.base_rom_url }}
+        run: |
+          mkdir -p "$PORT_WORKDIR/downloads"
+          cd "$PORT_WORKDIR/downloads"
+
+          echo "=== جاري تحميل Base ROM لهاتف miatoll/joyeuse ==="
+          BASE_EXT=".zip"
+          if [[ "$BASE_URL" == *".tgz"* ]] || [[ "$BASE_URL" == *".tar.gz"* ]]; then
+            BASE_EXT=".tgz"
+          fi
+          aria2c -x8 -s8 --file-allocation=none --check-certificate=false -d "$PORT_WORKDIR/downloads" -o "base_rom${BASE_EXT}" "$BASE_URL" \
+            || curl -fSL --retry 3 "$BASE_URL" -o "$PORT_WORKDIR/downloads/base_rom${BASE_EXT}"
+
+          python3 "$GITHUB_WORKSPACE/porting/unpack_rom.py" \
+            --input "$PORT_WORKDIR/downloads/base_rom${BASE_EXT}" \
+            --role base \
+            --workdir "$PORT_WORKDIR"
+          df -h /
+
+      - name: تحميل وفك روم الواجهة المراد نقلها (Download & Unpack Port ROM)
+        env:
+          PORT_URL: ${{ inputs.port_rom_url }}
+        run: |
+          mkdir -p "$PORT_WORKDIR/downloads"
+          cd "$PORT_WORKDIR/downloads"
+
+          echo "=== جاري تحميل Port ROM ==="
+          PORT_EXT=".zip"
+          if [[ "$PORT_URL" == *".tgz"* ]] || [[ "$PORT_URL" == *".tar.gz"* ]]; then
+            PORT_EXT=".tgz"
+          fi
+          aria2c -x8 -s8 --file-allocation=none --check-certificate=false -d "$PORT_WORKDIR/downloads" -o "port_rom${PORT_EXT}" "$PORT_URL" \
+            || curl -fSL --retry 3 "$PORT_URL" -o "$PORT_WORKDIR/downloads/port_rom${PORT_EXT}"
+
+          python3 "$GITHUB_WORKSPACE/porting/unpack_rom.py" \
+            --input "$PORT_WORKDIR/downloads/port_rom${PORT_EXT}" \
+            --role port \
+            --workdir "$PORT_WORKDIR"
+          df -h /
+
+      - name: تطبيق تعديلات البورت + EROFS + uclamp لهاتف joyeuse (Patch Port)
+        run: |
+          python3 "$GITHUB_WORKSPACE/porting/patch_port.py" \
+            --workdir "$PORT_WORKDIR" \
+            --ui-type "${{ inputs.ui_type }}" \
+            --enable-debloat "${{ inputs.enable_debloat }}" \
+            --enable-adb-debug "${{ inputs.enable_adb_debug }}" \
+            --disable-dfe "${{ inputs.disable_dfe }}"
+          df -h /
+
+      - name: تجهيز/ترجمة كيرنل EROFS + uclamp وتحديث boot.img و vbmeta
+        env:
+          K_MODE: ${{ inputs.kernel_mode }}
+          K_URL: ${{ inputs.custom_kernel_url }}
+          D_DFE: ${{ inputs.disable_dfe }}
+        run: |
+          "$GITHUB_WORKSPACE/porting/kernel_handler.sh" \
+            "$PORT_WORKDIR" \
+            "$K_MODE" \
+            "$K_URL" \
+            "$D_DFE"
+
+      - name: ضغط EROFS وتجميع super.img والملف النهائي للتفليش (Repack ROM)
+        env:
+          R_NAME: ${{ inputs.rom_name }}
+        run: |
+          "$GITHUB_WORKSPACE/porting/repack_rom.sh" \
+            "$PORT_WORKDIR" \
+            "$R_NAME"
+
+      - name: رفع الروم إلى GoFile وعرض رابط التحميل المباشر (Upload ROM)
+        if: success()
+        run: |
+          ROM_ZIP=$(find "$PORT_WORKDIR/output" -maxdepth 1 -type f -name "*.zip" | head -n 1)
+          if [ -z "$ROM_ZIP" ]; then
+            echo "::error::لم يتم العثور على ملف الروم النهائي!"
+            exit 1
+          fi
+
+          ZIP_NAME="$(basename "$ROM_ZIP")"
+          ZIP_SIZE="$(du -h "$ROM_ZIP" | cut -f1)"
+          ZIP_MD5="$(md5sum "$ROM_ZIP" | awk '{print $1}')"
+
+          echo "=== جاري رفع ${ZIP_NAME} (${ZIP_SIZE}) إلى GoFile ==="
+          RESP=$(curl -sSL -F "file=@${ROM_ZIP}" https://upload.gofile.io/uploadfile)
+          echo "GoFile Response: $RESP"
+          DL_URL=$(echo "$RESP" | jq -r '.data.downloadPage // empty')
+
+          {
+            echo "## 🎉 اكتمل بورت الروم بنجاح لهاتف \`joyeuse / miatoll\`!"
+            echo ""
+            echo "| البيان | القيمة |"
+            echo "| :--- | :--- |"
+            echo "| **اسم الملف** | \`${ZIP_NAME}\` |"
+            echo "| **الحجم** | \`${ZIP_SIZE}\` |"
+            echo "| **بصمة MD5** | \`${ZIP_MD5}\` |"
+            echo "| **نظام الملفات والجدولة** | \`EROFS (lz4hc,9) + uclamp\` |"
+            if [ -n "$DL_URL" ]; then
+              echo "| **🔗 رابط التحميل المباشر (GoFile)** | [**اضغط هنا لتحميل الروم**](${DL_URL}) |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=========================================================="
+          echo "✅ رابط التحميل المباشر (GoFile): ${DL_URL}"
+          echo "=========================================================="
