@@ -9,9 +9,9 @@ on:
         default: "OEM-Port"
         type: string
       base_rom_url:
-        description: "رابط الروم الأساسي لهاتف miatoll/joyeuse (لأخذ تعريفات العتاد Vendor/Boot)"
+        description: "رابط الروم الأساسي لهاتف miatoll/joyeuse (افتراضياً: MiatollCave 2026-11-06 المحدث)"
         required: true
-        default: ""
+        default: "https://pixeldrain.com/api/file/TS1cn1RH"
         type: string
       port_rom_url:
         description: "رابط روم الواجهة الكاملة المراد سحب النظام منها (Port ROM URL)"
@@ -124,7 +124,9 @@ jobs:
           if [[ "$BASE_URL" == *".tgz"* ]] || [[ "$BASE_URL" == *".tar.gz"* ]]; then
             BASE_EXT=".tgz"
           fi
-          aria2c -x8 -s8 --file-allocation=none --check-certificate=false -d "$PORT_WORKDIR/downloads" -o "base_rom${BASE_EXT}" "$BASE_URL" \
+          ARIA_CONN="-x16 -s16"
+          [[ "$BASE_URL" == *"pixeldrain.com"* ]] && ARIA_CONN="-x4 -s4"
+          aria2c $ARIA_CONN --file-allocation=none --check-certificate=false -d "$PORT_WORKDIR/downloads" -o "base_rom${BASE_EXT}" "$BASE_URL" \
             || curl -fSL --retry 3 "$BASE_URL" -o "$PORT_WORKDIR/downloads/base_rom${BASE_EXT}"
 
           python3 "$GITHUB_WORKSPACE/porting/unpack_rom.py" \

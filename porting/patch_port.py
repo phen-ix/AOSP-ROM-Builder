@@ -19,12 +19,51 @@ import stat
 from pathlib import Path
 
 SAFE_DEBLOAT_KEYWORDS = [
+    # Chinese / Regional Bloat & Ads
     "BaiduIME", "SogouInput", "IflytekIME", "MiShop", "Youpin", "GameCenter",
     "MiFinance", "Wallet", "HybridPlatform", "AnalyticsCore", "MSA", "msa",
-    "mab", "Updater", "SystemUpdate", "Ota", "Netflix", "Facebook", "TikTok",
-    "Weibo", "Bilibili", "Alipay", "Taobao", "JD", "Meituan", "WPSOffice",
-    "BrowserVideo", "MiCredit", "PaymentService", "HeytapBrowser", "HeytapMarket",
-    "KeKeMarket", "NearmeGameCenter", "OppoShop",
+    "mab", "Updater", "SystemUpdate", "Ota", "Weibo", "Bilibili", "Alipay",
+    "Taobao", "JD", "Meituan", "BrowserVideo", "MiCredit", "PaymentService",
+    "HeytapBrowser", "HeytapMarket", "KeKeMarket", "NearmeGameCenter", "OppoShop",
+    # Xiaomi Global Bloat, Ads & Crashing Services
+    "Joyose", "MiLink", "Lyra", "uceShimService", "CatchLog", "MiBugReport",
+    "MIService", "MIUIYellowPage", "MITSMClient", "MIUIMiPicks", "MiPicks",
+    "MIBrowser", "BrowserGlobal", "MIUIMusic", "MIUIVideo", "MiVideo",
+    "GlobalWPSLITE", "WPSOffice", "MISTORE_OVERSEA", "MICOMMUNITY", "PocoBBS",
+    "MIUIHealth", "SmartHome", "MIDrop", "MiDrop", "PlayAutoInstallStub",
+    # Heavy Wallpapers & Lockscreen Magazine
+    "SuperWallpaper", "MiGalleryLockScreen", "FashionGallery", "WallpaperCarousel",
+    # Voice / Speech AI Bloat (Selected for removal; core MiSound/AudioFX stays protected)
+    "SpeechServicesByGoogle", "GoogleTTS", "HotwordEnrollment", "AiAsstVision",
+    "VoiceAssist", "VoiceTrigger", "MiBrainSpeech",
+    # Secondary Downloadable Google Apps (Core GMS/Play Store/WebView/Gboard stay protected)
+    "YouTube", "YTMusic", "Maps", "Gmail2", "Drive", "Photos", "Videos",
+    "Tachyon", "Meet", "GoogleOne", "GoogleNews", "Magazines", "Podcasts",
+    "TrichromeChrome", "Chromecast", "AndroidAuto", "Gearhead",
+    # Third-Party & European Carrier Bloat
+    "Netflix", "Facebook", "facebook-", "TikTok", "Instagram", "Spotify",
+    "Booking", "LinkedIn", "Snapchat", "AliExpress", "MicrosoftOneDrive",
+    "LinkToWindows", "AmazonAppManager", "amazon.appmanager", "ebay.carrier",
+    "ChiliCompanion", "AppBox", "AppCloud", "AppCenter", "sfrjeux", "bygIgnite",
+    "myapps", "OrangeManualSelector",
+]
+
+# Essential system, GMS, WebView, Input, Audio & Utility packages that must NEVER be deleted
+PROTECTED_CORE_KEYWORDS = [
+    "GmsCore", "PrebuiltGmsCore", "GoogleServicesFramework", "Phonesky",
+    "GoogleLoginService", "GoogleBackupTransport", "GoogleContactsSyncAdapter",
+    "GoogleCalendarSyncAdapter", "GoogleOneTimeInitializer", "GooglePartnerSetup",
+    "SetupWizard", "GoogleRestore", "AndroidPlatformServices",
+    "GoogleWebView", "WebViewGoogle", "TrichromeLibrary",
+    "LatinIMEGoogle", "Gboard", "Velvet",
+    "GoogleDialer", "GoogleContacts", "PrebuiltBugle", "Messages",
+    "MiSound", "Misound", "AudioFX", "MusicFX", "Dolby", "Dirac",
+    "MiuiCamera", "XMRemoteController", "MIUIScreenRecorder", "Calculator",
+    "DeskClock", "SoundRecorder", "Weather", "MIUICompass", "MiuiScanner",
+    "NQNfcNci", "SecureElement", "SecurityCenter", "MIUISecurity",
+    "MiuiHome", "MIUISystemUI", "Settings", "PermissionController",
+    "PackageInstaller", "DocumentsUI", "DownloadProvider", "MediaProvider",
+    "TelephonyProvider", "TeleService", "Telecom",
 ]
 
 JOYEUSE_HYPEROS_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -307,6 +346,44 @@ def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
         if copied_sf:
             print(f"  [VIDEO-FIX] تم زرع {copied_sf} مكتبة libstagefright متوافقة مع OMX لمعالج SM6250 (SDK {f_sdk})", flush=True)
 
+        # 4. Camera MiaFrame v10 algoup/mianode JNI fix from MiatollCave 2026-11-06
+        copied_cam_jni = 0
+        for lib_sub in ("lib", "lib64"):
+            for cam_so in ("libcamera_algoup_jni.xiaomi.so", "libcamera_mianode_jni.xiaomi.so"):
+                src_so = base_dir / "system_ext" / lib_sub / cam_so
+                dst_so = final_dir / "system_ext" / lib_sub / cam_so
+                if src_so.is_file() and dst_so.parent.is_dir():
+                    shutil.copy2(src_so, dst_so)
+                    copied_cam_jni += 1
+        if copied_cam_jni:
+            print(f"  [CAMERA-FIX] تم زرع {copied_cam_jni} مكتبة algoup/mianode JNI متوافقة مع MiaFrame v10 لكاميرا miatoll", flush=True)
+
+    # 5. Disable crashing CollectRunningTasksService on boot (xd_port_fixes.xml)
+    syscfg_dir = final_dir / "system_ext" / "etc" / "sysconfig"
+    if syscfg_dir.is_dir():
+        (syscfg_dir / "xd_port_fixes.xml").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<config>\n'
+            '    <component-override package="com.xiaomi.xmsf">\n'
+            '        <component class="com.xiaomi.xmsf.eventtracking.CollectRunningTasksService" enabled="false" />\n'
+            '    </component-override>\n'
+            '</config>\n',
+            encoding="utf-8",
+        )
+        print("  [BOOT-FIX] تم حقن xd_port_fixes.xml لمنع انهيار CollectRunningTasksService عند الإقلاع", flush=True)
+
+    # 6. Merge product/pangu/system -> product for NFC (NQNfcNci) if pangu split exists
+    pangu_sys = final_dir / "product" / "pangu" / "system"
+    if pangu_sys.is_dir():
+        for sub in pangu_sys.iterdir():
+            dest_sub = final_dir / "product" / sub.name
+            if sub.is_dir():
+                shutil.copytree(sub, dest_sub, symlinks=True, dirs_exist_ok=True)
+            else:
+                shutil.copy2(sub, dest_sub, follow_symlinks=False)
+        shutil.rmtree(final_dir / "product" / "pangu", ignore_errors=True)
+        print("  [NFC-FIX] تم دمج product/pangu/system داخل product لتفعيل NFC وتقليل التكرار", flush=True)
+
 
 def transplant_vndk_and_selinux_mappings(base_dir: Path, final_dir: Path):
     """Transplant missing VNDK APEX (e.g. v30 for SM6250) and SELinux CIL mapping files from Base ROM."""
@@ -388,11 +465,29 @@ def transplant_vndk_and_selinux_mappings(base_dir: Path, final_dir: Path):
 def run_smart_debloat(final_dir: Path):
     removed_bytes = 0
     removed_count = 0
+
+    def is_protected(name: str) -> bool:
+        low = name.lower()
+        # Never confuse Chrome browser (TrichromeChrome) with TrichromeLibrary/WebView
+        if "trichromechrome" in low or low in ("chrome", "chromestub"):
+            return False
+        return any(pk.lower() in low for pk in PROTECTED_CORE_KEYWORDS)
+
+    def matches_bloat(name: str, rel_dir: str) -> bool:
+        if is_protected(name):
+            return False
+        low = name.lower()
+        if "data-app" in rel_dir or "del-app" in rel_dir:
+            return True
+        if low in ("chrome", "chromestub"):
+            return True
+        return any(k.lower() in low for k in SAFE_DEBLOAT_KEYWORDS)
+
     search_dirs = [
         "system/system/app", "system/system/priv-app", "system/app", "system/priv-app",
         "product/app", "product/priv-app", "product/data-app",
         "system_ext/app", "system_ext/priv-app",
-        "mi_ext/product/app", "mi_ext/product/data-app",
+        "mi_ext/product/app", "mi_ext/product/priv-app", "mi_ext/product/data-app",
         "my_stock/app", "my_stock/del-app", "my_heytap/app", "my_preload/app",
     ]
     for rel in search_dirs:
@@ -400,7 +495,7 @@ def run_smart_debloat(final_dir: Path):
         if not d.is_dir():
             continue
         for entry in list(d.iterdir()):
-            if "data-app" in rel or "del-app" in rel or any(k.lower() in entry.name.lower() for k in SAFE_DEBLOAT_KEYWORDS):
+            if matches_bloat(entry.name, rel):
                 size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file() and not f.is_symlink()) if entry.is_dir() else entry.stat().st_size
                 if entry.is_dir():
                     shutil.rmtree(entry, ignore_errors=True)
@@ -408,7 +503,47 @@ def run_smart_debloat(final_dir: Path):
                     entry.unlink(missing_ok=True)
                 removed_bytes += size
                 removed_count += 1
-    print(f"  [DEBLOAT] تم حذف {removed_count} تطبيق/حزمة زائدة (توفير {removed_bytes / (1024*1024):.1f} MB)", flush=True)
+
+    # Remove carrier bloat APKs inside opcust (Vodafone, Orange, Amazon, eBay, etc.)
+    for opcust_rel in ("product/opcust", "mi_ext/product/opcust"):
+        op_dir = final_dir / opcust_rel
+        if op_dir.is_dir():
+            for apk in list(op_dir.rglob("*.apk")):
+                if not is_protected(apk.name):
+                    removed_bytes += apk.stat().st_size
+                    removed_count += 1
+                    apk_parent = apk.parent
+                    apk.unlink(missing_ok=True)
+                    shutil.rmtree(apk_parent / "oat", ignore_errors=True)
+
+    # Remove heavy video / animated / editor wallpaper packs while keeping lightweight static defaults
+    heavy_wp_bytes = 0
+    for wp_rel in ("product/media/wallpaper", "mi_ext/product/media/wallpaper"):
+        wp_dir = final_dir / wp_rel
+        if not wp_dir.is_dir():
+            continue
+        for sub_name in ("wallpaper_video", "sysui_editor_wallpaper_group", "super_wallpaper"):
+            sub_d = wp_dir / sub_name
+            if sub_d.is_dir():
+                sz = sum(f.stat().st_size for f in sub_d.rglob("*") if f.is_file() and not f.is_symlink())
+                shutil.rmtree(sub_d, ignore_errors=True)
+                heavy_wp_bytes += sz
+        for wf in list(wp_dir.rglob("*")):
+            if not wf.is_file() or wf.is_symlink():
+                continue
+            wlow = wf.name.lower()
+            if "default" in wlow:
+                continue
+            if wlow.endswith((".mp4", ".webm", ".mkv", ".mov")) or wf.stat().st_size > 4 * 1024 * 1024:
+                heavy_wp_bytes += wf.stat().st_size
+                wf.unlink(missing_ok=True)
+
+    removed_bytes += heavy_wp_bytes
+    print(
+        f"  [DEBLOAT] تم حذف {removed_count} حزمة زائدة + الخلفيات الثقيلة ({heavy_wp_bytes / (1024*1024):.1f} MB) "
+        f"| إجمالي التوفير = {removed_bytes / (1024*1024):.1f} MB (مع حماية خدمات Google الأساسية و MiSound و WebView)",
+        flush=True,
+    )
 
 
 def reconcile_selinux_configs(part_dir: Path, config_dir: Path, part_name: str):
@@ -573,7 +708,7 @@ def main():
     if (final_dir / "vendor").is_dir():
         patch_uclamp_vendor(final_dir / "vendor")
 
-    # 8. Patch build.prop files for joyeuse / miatoll compatibility (side fingerprint, 440 DPI, 60Hz LCD)
+    # 8. Patch build.prop files for joyeuse / miatoll compatibility (side fingerprint, 440 DPI, 60Hz LCD, I/O & Preread fixes)
     common_props = {
         "ro.sf.lcd_density": "440",
         "persist.sys.disable_rescue": "true",
@@ -581,6 +716,22 @@ def main():
         "ro.hardware.fp.fod": "false",
         "ro.hardware.fp.sideCap": "true",
         "ro.vendor.display.default_fps": "60",
+        # Fix 5-second iorapd/preread crash loop (/dev/iorap_dev absent on SM6250) & debug monitors
+        "persist.sys.stability.PrereadEnable": "false",
+        "persist.sys.app_resurrection.enable": "false",
+        "persist.sys.debug.app.mtbf_test": "false",
+        "persist.sys.perfdebug.monitor.enable": "0",
+        # Prevent flagship 12GB RAM background app pre-starting & UFS I/O thrashing on 6GB joyeuse
+        "ro.config.low_ram.threshold_gb": "0",
+        "persist.sys.app_dexfile_preload.enable": "false",
+        "persist.sys.spc.proc_restart_enable": "false",
+        "persist.sys.preload.enable": "false",
+        "persist.sys.precache.enable": "false",
+        "persist.sys.prestart.proc": "false",
+        "persist.sys.prestart.feedback.enable": "false",
+        "persist.sys.performance.appLaunchPreload.enable": "false",
+        "persist.sys.smartcache.enable": "false",
+        "persist.sys.art_startup_class_preload.enable": "false",
     }
     if args.enable_adb_debug.lower() == "true":
         common_props.update({
