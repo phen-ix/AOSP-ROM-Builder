@@ -104,9 +104,6 @@ elif [ "$KERNEL_MODE" = "compile_phenix_new" ]; then
   echo "=== [3/4] ترجمة كيرنل phen-ix/new (فرع uclamp-erofs: KCAL + uclamp + EROFS) ==="
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-    bc flex bison libssl-dev libelf-dev python2 python3 ccache || \
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
     bc flex bison libssl-dev libelf-dev python3 ccache
 
   CLANG_DIR="${WORKDIR}/clang12"

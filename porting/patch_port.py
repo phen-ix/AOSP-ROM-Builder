@@ -128,8 +128,8 @@ def patch_fstab_file(fstab_path: Path, logical_parts: list[str], disable_dfe: bo
 
 def patch_uclamp_vendor(vendor_dir: Path):
     print("=== تحويل إعدادات الأداء في Vendor من stune إلى uclamp ===", flush=True)
-    # 1. Patch powerhint.json
-    for ph_path in list(vendor_dir.glob("etc/powerhint.json")) + list(vendor_dir.glob("etc/power/powerhint.json")):
+    # 1. Patch powerhint.json across vendor/etc/** (including etc/perf/powerhint.json on QTI)
+    for ph_path in sorted(set(vendor_dir.rglob("powerhint.json"))):
         try:
             data = json.loads(ph_path.read_text(encoding="utf-8", errors="ignore"))
             nodes = data.get("Nodes", [])
@@ -376,9 +376,10 @@ def main():
         if p.strip()
     ]
     for ppart in port_parts:
-        if ppart in ("vendor",):
-            continue
-        if ppart == "odm" and (final_dir / "odm").is_dir():
+        # Never take lower-half SoC/board partitions (vendor, odm, *_dlkm) from Port ROM;
+        # on miatoll/joyeuse, /odm symlinks to /vendor/odm with SM6250 + NFC configs.
+        if ppart in ("vendor", "odm", "vendor_dlkm", "odm_dlkm"):
+            print(f"  [SKIP] تجاهل بارتيشن العتاد [{ppart}] من روم البورت للحفاظ على توافق معالج joyeuse/SM6250", flush=True)
             continue
         src = port_dir / ppart
         if src.is_dir():
