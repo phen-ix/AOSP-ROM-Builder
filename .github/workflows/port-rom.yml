@@ -118,6 +118,7 @@ jobs:
           cd "$PORT_WORKDIR/downloads"
 
           echo "=== جاري تحميل Base ROM لهاتف miatoll/joyeuse ==="
+          BASE_URL="${BASE_URL/pixeldrain.com\/u\//pixeldrain.com\/api\/file\/}"
           BASE_EXT=".zip"
           if [[ "$BASE_URL" == *".tgz"* ]] || [[ "$BASE_URL" == *".tar.gz"* ]]; then
             BASE_EXT=".tgz"
@@ -139,6 +140,7 @@ jobs:
           cd "$PORT_WORKDIR/downloads"
 
           echo "=== جاري تحميل Port ROM ==="
+          PORT_URL="${PORT_URL/pixeldrain.com\/u\//pixeldrain.com\/api\/file\/}"
           PORT_EXT=".zip"
           if [[ "$PORT_URL" == *".tgz"* ]] || [[ "$PORT_URL" == *".tar.gz"* ]]; then
             PORT_EXT=".tgz"

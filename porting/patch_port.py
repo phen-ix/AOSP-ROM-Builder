@@ -36,6 +36,8 @@ JOYEUSE_HYPEROS_XML = """<?xml version="1.0" encoding="UTF-8"?>
     <bool name="support_nfc">true</bool>
     <bool name="support_se_route">true</bool>
     <bool name="support_ir">true</bool>
+    <bool name="support_fod">false</bool>
+    <bool name="is_BackFingerprint">false</bool>
     <bool name="support_fp_nav_event_name_list">true</bool>
     <integer name="finger_wakeup_type">2</integer>
     <bool name="support_screen_light">true</bool>
@@ -405,11 +407,10 @@ def main():
         df_dir = final_dir / "product" / "etc" / "device_features"
         df_dir.mkdir(parents=True, exist_ok=True)
         base_xml = base_dir / "product" / "etc" / "device_features" / "joyeuse.xml"
-        if base_xml.is_file():
-            shutil.copy2(base_xml, df_dir / "joyeuse.xml")
-        elif not (df_dir / "joyeuse.xml").is_file():
-            (df_dir / "joyeuse.xml").write_text(JOYEUSE_HYPEROS_XML, encoding="utf-8")
-        print("  [HYPEROS] تم تجهيز ملف خصائص joyeuse.xml (دعم NFC + IR + بطارية 5020mAh)", flush=True)
+        xml_content = base_xml.read_text(encoding="utf-8", errors="ignore") if base_xml.is_file() else JOYEUSE_HYPEROS_XML
+        for dev_codename in ("joyeuse", "miatoll", "curtana"):
+            (df_dir / f"{dev_codename}.xml").write_text(xml_content, encoding="utf-8")
+        print("  [HYPEROS] تم تجهيز ملفات خصائص joyeuse/miatoll (بصمة جانبية + NFC + IR + بطارية 5020mAh)", flush=True)
 
     # 5. Free base_dir & port_dir (keep base/firmware for boot/dtbo/vbmeta)
     shutil.rmtree(base_dir / "product", ignore_errors=True)
@@ -424,11 +425,14 @@ def main():
     if (final_dir / "vendor").is_dir():
         patch_uclamp_vendor(final_dir / "vendor")
 
-    # 8. Patch build.prop files for joyeuse / miatoll compatibility
+    # 8. Patch build.prop files for joyeuse / miatoll compatibility (side fingerprint, 440 DPI, 60Hz LCD)
     common_props = {
         "ro.sf.lcd_density": "440",
         "persist.sys.disable_rescue": "true",
         "ro.Incremental.enable": "false",
+        "ro.hardware.fp.fod": "false",
+        "ro.hardware.fp.sideCap": "true",
+        "ro.vendor.display.default_fps": "60",
     }
     if args.enable_adb_debug.lower() == "true":
         common_props.update({
