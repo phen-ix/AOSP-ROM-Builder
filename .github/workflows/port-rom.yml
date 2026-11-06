@@ -32,9 +32,10 @@ on:
       kernel_mode:
         description: "وضع معالجة الكيرنل (EROFS + uclamp)"
         required: true
-        default: "compile_nexusbase"
+        default: "compile_phenix_new"
         type: choice
         options:
+          - compile_phenix_new
           - compile_nexusbase
           - custom_url
           - keep_base

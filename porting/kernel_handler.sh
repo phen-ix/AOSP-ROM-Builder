@@ -100,6 +100,52 @@ if [ "$KERNEL_MODE" = "custom_url" ] && [ -n "$CUSTOM_KERNEL_URL" ]; then
     popd >/dev/null
   fi
 
+elif [ "$KERNEL_MODE" = "compile_phenix_new" ]; then
+  echo "=== [3/4] ترجمة كيرنل phen-ix/new (فرع uclamp-erofs: KCAL + uclamp + EROFS) ==="
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+    bc flex bison libssl-dev libelf-dev python2 python3 ccache || \
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+    bc flex bison libssl-dev libelf-dev python3 ccache
+
+  CLANG_DIR="${WORKDIR}/clang12"
+  git clone --depth=1 -b lineage-20.0 \
+    https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git "$CLANG_DIR"
+  export PATH="${CLANG_DIR}/bin:${PATH}"
+
+  K_SRC="${WORKDIR}/kernel_src"
+  git clone --depth=1 -b uclamp-erofs https://github.com/phen-ix/new.git "$K_SRC"
+
+  pushd "$K_SRC" >/dev/null
+  make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 vendor/xiaomi/miatoll_defconfig
+  make -j"$(nproc)" O=out ARCH=arm64 \
+    CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+    CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+    Image.gz dtbs
+
+  if [ -f "out/arch/arm64/boot/Image.gz" ]; then
+    cp -f "out/arch/arm64/boot/Image.gz" "${BOOT_TMP}/kernel"
+  elif [ -f "out/arch/arm64/boot/Image" ]; then
+    cp -f "out/arch/arm64/boot/Image" "${BOOT_TMP}/kernel"
+  else
+    echo "❌ فشل العثور على صورة النواة المترجمة Image.gz!"
+    exit 1
+  fi
+
+  if [ -f "out/arch/arm64/boot/dts/qcom/cust-atoll-ab.dtb" ]; then
+    cp -f "out/arch/arm64/boot/dts/qcom/cust-atoll-ab.dtb" "${BOOT_TMP}/dtb"
+    echo "  [DTB] تم تحديث cust-atoll-ab.dtb من كيرنل phen-ix/new"
+  fi
+
+  if compgen -G "out/arch/arm64/boot/dts/qcom/*.dtbo" >/dev/null && [ -f "scripts/dtc/mkdtboimg.py" ]; then
+    python3 scripts/dtc/mkdtboimg.py create "${OUT_FW}/dtbo.img.new" --page_size=4096 out/arch/arm64/boot/dts/qcom/*.dtbo && \
+      mv -f "${OUT_FW}/dtbo.img.new" "${OUT_FW}/dtbo.img" && \
+      echo "  [DTBO] تم توليد dtbo.img المخصص لـ joyeuse/miatoll بنجاح" || true
+  fi
+  popd >/dev/null
+  rm -rf "$K_SRC" "$CLANG_DIR"
+
 elif [ "$KERNEL_MODE" = "compile_nexusbase" ]; then
   echo "=== [3/4] ترجمة كيرنل phen-ix/nexusbase (uclamp) مع دمج دعم EROFS ==="
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
