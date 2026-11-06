@@ -206,9 +206,9 @@ def check_stage1_boot_and_fstab(workdir: Path) -> tuple[bool, str]:
             if not re.search(rf"^{re.escape(lp)}\s+\S+\s+erofs\b", txt, re.MULTILINE):
                 return False, f"البارتيشن [{lp}] غير مسجل بصيغة erofs داخل ramdisk:{fn}!"
 
-    # 3. Check DTB magic (boot header v2)
-    if header_ver >= 2:
-        dtb_sz = struct.unpack_from("<I", data, 1640)[0]
+    # 3. Check DTB magic (boot header v2: dtb_size is at byte offset 1648)
+    if header_ver >= 2 and len(data) >= 1652:
+        dtb_sz = struct.unpack_from("<I", data, 1648)[0]
         dtb_off = page_sz + align(kernel_sz) + align(ramdisk_sz) + align(second_sz)
         if dtb_sz > 0:
             dtb_magic = data[dtb_off : dtb_off + 4]

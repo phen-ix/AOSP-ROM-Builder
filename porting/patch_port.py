@@ -231,19 +231,81 @@ def copy_hardware_overlays(base_product: Path, final_product: Path):
     final_ov = final_product / "overlay"
     if not base_ov.is_dir() or not final_ov.is_dir():
         return
+    # DevicesOverlay.apk is signed with Xiaomi's official key and carries LCD brightness curves,
+    # cutout dimensions, and side-fingerprint coordinates for joyeuse/miatoll.
+    force_replace = {"devicesoverlay.apk"}
     hw_patterns = ("miatoll", "joyeuse", "atoll", "sm6250", "cutout", "notch", "wifi", "tethering", "carrierconfig")
     copied = 0
     for item in base_ov.iterdir():
         lname = item.name.lower()
-        if any(p in lname for p in hw_patterns):
-            dest = final_ov / item.name
-            if not dest.exists():
-                if item.is_dir():
-                    shutil.copytree(item, dest, symlinks=True)
-                else:
-                    shutil.copy2(item, dest, follow_symlinks=False)
-                copied += 1
-    print(f"  [OVERLAY] تم نقل {copied} من ملفات الـ Overlay الخاصة بعتاد joyeuse/miatoll", flush=True)
+        dest = final_ov / item.name
+        if lname in force_replace:
+            if dest.exists():
+                shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
+            shutil.copy2(item, dest, follow_symlinks=False)
+            copied += 1
+            print(f"  [OVERLAY] تم استبدال {item.name} بنسخة joyeuse/miatoll الرسمية (سطوع شاشة LCD + البصمة الجانبية)", flush=True)
+        elif any(p in lname for p in hw_patterns) and not dest.exists():
+            if item.is_dir():
+                shutil.copytree(item, dest, symlinks=True)
+            else:
+                shutil.copy2(item, dest, follow_symlinks=False)
+            copied += 1
+    print(f"  [OVERLAY] إجمالي ملفات الـ Overlay المنقولة لعتاد joyeuse/miatoll = {copied}", flush=True)
+
+
+def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
+    """Transplant proven SM6250/miatoll fixes from Base ROM:
+       1. USB ConfigFS init scripts when vendor.usb.use_gadget_hal=0 (fixes USB MTP & ADB)
+       2. Linux 4.14 cgroup v1 + uclamp task_profiles.json (fixes Android 15 Cached App Freezer)
+       3. Qualcomm OMX libstagefright*.so when Base & Port share identical Android SDK version (fixes HW video)
+    """
+    final_sys = (final_dir / "system" / "system") if (final_dir / "system" / "system" / "build.prop").is_file() else (final_dir / "system")
+    base_sys = (base_dir / "system" / "system") if (base_dir / "system" / "system" / "build.prop").is_file() else (base_dir / "system")
+    if not base_sys.is_dir() or not final_sys.is_dir():
+        return
+
+    vendor_bp = (final_dir / "vendor" / "build.prop").read_text(encoding="utf-8", errors="ignore") if (final_dir / "vendor" / "build.prop").is_file() else ""
+
+    # 1. USB ConfigFS init scripts for SM6250 (use_gadget_hal=0)
+    if "vendor.usb.use_gadget_hal=0" in vendor_bp:
+        for usb_rc in ("init.usb.rc", "init.usb.configfs.rc"):
+            src = base_sys / "etc" / "init" / "hw" / usb_rc
+            dst = final_sys / "etc" / "init" / "hw" / usb_rc
+            if src.is_file() and dst.parent.is_dir():
+                shutil.copy2(src, dst)
+                print(f"  [USB-FIX] تم نقل {usb_rc} المتوافق مع SM6250 لتشغيل MTP و ADB عبر السلك", flush=True)
+
+    # 2. Linux 4.14 cgroup v1 freezer + uclamp task_profiles.json
+    b_tp = base_sys / "etc" / "task_profiles.json"
+    f_tp = final_sys / "etc" / "task_profiles.json"
+    if b_tp.is_file() and "UClampMin" in b_tp.read_text(encoding="utf-8", errors="ignore"):
+        shutil.copy2(b_tp, f_tp)
+        print("  [CGROUP-FIX] تم نقل task_profiles.json المتوافق مع نواة 4.14 (uclamp + cgroup v1 freezer)", flush=True)
+
+    # 3. Qualcomm OMX libstagefright*.so video playback/encoding fix (only when SDK matches, e.g. 35 == 35)
+    def get_sdk(sys_root: Path) -> str:
+        bp = sys_root / "build.prop"
+        if bp.is_file():
+            for ln in bp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if ln.startswith("ro.build.version.sdk="):
+                    return ln.split("=", 1)[1].strip()
+        return ""
+
+    b_sdk, f_sdk = get_sdk(base_sys), get_sdk(final_sys)
+    if b_sdk and b_sdk == f_sdk:
+        copied_sf = 0
+        for lib_sub in ("lib", "lib64"):
+            b_ldir = base_sys / lib_sub
+            f_ldir = final_sys / lib_sub
+            if not b_ldir.is_dir() or not f_ldir.is_dir():
+                continue
+            for sf in b_ldir.glob("libstagefright*.so"):
+                if sf.is_file() and not sf.is_symlink():
+                    shutil.copy2(sf, f_ldir / sf.name)
+                    copied_sf += 1
+        if copied_sf:
+            print(f"  [VIDEO-FIX] تم زرع {copied_sf} مكتبة libstagefright متوافقة مع OMX لمعالج SM6250 (SDK {f_sdk})", flush=True)
 
 
 def transplant_vndk_and_selinux_mappings(base_dir: Path, final_dir: Path):
@@ -478,20 +540,24 @@ def main():
     ui_type = detect_ui_type(final_dir, args.ui_type)
     print(f"=== نوع الواجهة المكتشفة للبورت: [{ui_type.upper()}] | البارتيشنات: {final_parts} ===", flush=True)
 
-    # 3. Copy hardware overlays + transplant missing VNDK APEX & SELinux mapping CILs from Base
+    # 3. Copy hardware overlays + transplant missing VNDK APEX, SELinux mappings & SM6250 HAL fixes from Base
     if (base_dir / "product").is_dir() and (final_dir / "product").is_dir():
         copy_hardware_overlays(base_dir / "product", final_dir / "product")
     transplant_vndk_and_selinux_mappings(base_dir, final_dir)
+    transplant_miatoll_hal_fixes(base_dir, final_dir)
 
-    # 4. HyperOS joyeuse device_features XML
+    # 4. HyperOS joyeuse/miatoll device_features XMLs
     if ui_type == "hyperos" and (final_dir / "product").is_dir():
         df_dir = final_dir / "product" / "etc" / "device_features"
         df_dir.mkdir(parents=True, exist_ok=True)
-        base_xml = base_dir / "product" / "etc" / "device_features" / "joyeuse.xml"
-        xml_content = base_xml.read_text(encoding="utf-8", errors="ignore") if base_xml.is_file() else JOYEUSE_HYPEROS_XML
-        for dev_codename in ("joyeuse", "miatoll", "curtana"):
+        base_df = base_dir / "product" / "etc" / "device_features"
+        for dev_codename in ("joyeuse", "miatoll", "curtana", "excalibur", "gram"):
+            cand = base_df / f"{dev_codename}.xml"
+            if not cand.is_file():
+                cand = base_df / "joyeuse.xml"
+            xml_content = cand.read_text(encoding="utf-8", errors="ignore") if cand.is_file() else JOYEUSE_HYPEROS_XML
             (df_dir / f"{dev_codename}.xml").write_text(xml_content, encoding="utf-8")
-        print("  [HYPEROS] تم تجهيز ملفات خصائص joyeuse/miatoll (بصمة جانبية + NFC + IR + بطارية 5020mAh)", flush=True)
+        print("  [HYPEROS] تم تجهيز ملفات خصائص عائلة joyeuse/miatoll الكاملة (بصمة جانبية + NFC + IR + بطارية 5020mAh)", flush=True)
 
     # 5. Free base_dir & port_dir (keep base/firmware for boot/dtbo/vbmeta)
     for bcleanup in ("product", "system_ext", "system", "odm"):
