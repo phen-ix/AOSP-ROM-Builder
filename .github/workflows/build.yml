@@ -1,0 +1,313 @@
+name: AOSP ROM Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: "رابط المانيفست (اتركه فارغاً لاستخدام القيمة داخل الملف)"
+        required: false
+        default: ""
+        type: string
+      manifest_branch:
+        description: "فرع المانيفست (مثال: lineage-21.0 أو android-14.0.0_r1)"
+        required: false
+        default: ""
+        type: string
+      device_tree_url:
+        description: "رابط شجرة الجهاز Device Tree (اختياري هنا إذا وضعته بالملف)"
+        required: false
+        default: ""
+        type: string
+      device_tree_path:
+        description: "مسار شجرة الجهاز (مثال: device/xiaomi/lavender)"
+        required: false
+        default: ""
+        type: string
+      lunch_combo:
+        description: "اسم Lunch Combo (مثال: lineage_lavender-userdebug)"
+        required: false
+        default: ""
+        type: string
+      build_target:
+        description: "أمر هدف البناء (مثال: bacon أو otapackage)"
+        required: false
+        default: ""
+        type: string
+      clean_repo_after_sync:
+        description: "حذف مجلد .repo بعد المزامنة لتوفير 25GB+ إضافية أثناء البناء"
+        required: false
+        default: false
+        type: boolean
+      upload_to_gofile:
+        description: "رفع ملف الروم تلقائياً إلى GoFile وطباعة رابط التحميل المباشر في السجل"
+        required: false
+        default: false
+        type: boolean
+
+# ==============================================================================
+# أوامر المتغيرات الأساسية (عدّل القيم الفارغة أدناه لبيانات جهازك والروم)
+# ==============================================================================
+env:
+  # 1. رابط المانيفست (سورس الروم) والفرع المطلوب
+  MANIFEST_URL: ""            # مثال: https://github.com/LineageOS/android.git
+  MANIFEST_BRANCH: ""         # مثال: lineage-21.0
+
+  # 2. شجرة الجهاز (Device Tree)
+  DEVICE_TREE_URL: ""         # مثال: https://github.com/LineageOS/android_device_xiaomi_lavender.git
+  DEVICE_TREE_BRANCH: ""      # اختياري - مثال: lineage-21.0 (يُترك فارغاً لاستخدام الفرع الافتراضي)
+  DEVICE_TREE_PATH: ""        # مثال: device/xiaomi/lavender
+
+  # 3. شجرة الـ Vendor والـ Kernel (اختياري - تُتخطى تلقائياً إن تُركت فارغة)
+  VENDOR_TREE_URL: ""         # مثال: https://github.com/TheMuppets/proprietary_vendor_xiaomi_lavender.git
+  VENDOR_TREE_BRANCH: ""      # اختياري
+  VENDOR_TREE_PATH: ""        # مثال: vendor/xiaomi/lavender
+
+  KERNEL_TREE_URL: ""         # مثال: https://github.com/LineageOS/android_kernel_xiaomi_sdm660.git
+  KERNEL_TREE_BRANCH: ""      # اختياري
+  KERNEL_TREE_PATH: ""        # مثال: kernel/xiaomi/sdm660
+
+  # 4. إعدادات أمر الـ Lunch وهدف البناء
+  LUNCH_COMBO: ""             # مثال: lineage_lavender-userdebug أو aosp_arm64-eng
+  BUILD_TARGET: "bacon"       # مثال: bacon (للرومات المعدلة) أو otapackage / m (لـ AOSP الخام)
+
+  # 5. مجلد العمل للبناء
+  WORK_DIR: "/home/runner/aosp"
+
+jobs:
+  build-rom:
+    name: Build AOSP ROM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: استنساخ مستودع الإعدادات (Checkout Workflow Repo)
+        uses: actions/checkout@v4
+
+      - name: التحقق من المتغيرات (Validate Configuration)
+        env:
+          IN_MANIFEST_URL: ${{ inputs.manifest_url }}
+          IN_MANIFEST_BRANCH: ${{ inputs.manifest_branch }}
+          IN_DEVICE_URL: ${{ inputs.device_tree_url }}
+          IN_DEVICE_PATH: ${{ inputs.device_tree_path }}
+          IN_LUNCH_COMBO: ${{ inputs.lunch_combo }}
+          IN_BUILD_TARGET: ${{ inputs.build_target }}
+        run: |
+          FINAL_MANIFEST_URL="${IN_MANIFEST_URL:-$MANIFEST_URL}"
+          FINAL_MANIFEST_BRANCH="${IN_MANIFEST_BRANCH:-$MANIFEST_BRANCH}"
+          FINAL_DEVICE_URL="${IN_DEVICE_URL:-$DEVICE_TREE_URL}"
+          FINAL_DEVICE_PATH="${IN_DEVICE_PATH:-$DEVICE_TREE_PATH}"
+          FINAL_LUNCH_COMBO="${IN_LUNCH_COMBO:-$LUNCH_COMBO}"
+          FINAL_BUILD_TARGET="${IN_BUILD_TARGET:-$BUILD_TARGET}"
+
+          echo "FINAL_MANIFEST_URL=${FINAL_MANIFEST_URL}" >> "$GITHUB_ENV"
+          echo "FINAL_MANIFEST_BRANCH=${FINAL_MANIFEST_BRANCH}" >> "$GITHUB_ENV"
+          echo "FINAL_DEVICE_URL=${FINAL_DEVICE_URL}" >> "$GITHUB_ENV"
+          echo "FINAL_DEVICE_PATH=${FINAL_DEVICE_PATH}" >> "$GITHUB_ENV"
+          echo "FINAL_LUNCH_COMBO=${FINAL_LUNCH_COMBO}" >> "$GITHUB_ENV"
+          echo "FINAL_BUILD_TARGET=${FINAL_BUILD_TARGET:-bacon}" >> "$GITHUB_ENV"
+
+          MISSING=0
+          if [ -z "$FINAL_MANIFEST_URL" ]; then
+            echo "::error::متغير MANIFEST_URL فارغ! يرجى إضافة رابط الروم في build.yml أو عبر نافذة Run workflow."
+            MISSING=1
+          fi
+          if [ -z "$FINAL_MANIFEST_BRANCH" ]; then
+            echo "::error::متغير MANIFEST_BRANCH فارغ! يرجى تحديد فرع الروم (مثل lineage-21.0)."
+            MISSING=1
+          fi
+          if [ -z "$FINAL_LUNCH_COMBO" ]; then
+            echo "::error::متغير LUNCH_COMBO فارغ! يرجى تحديد اسم الجهاز ونوع البناء (مثل lineage_lavender-userdebug)."
+            MISSING=1
+          fi
+          if [ -n "$FINAL_DEVICE_URL" ] && [ -z "$FINAL_DEVICE_PATH" ]; then
+            echo "::error::تم تحديد DEVICE_TREE_URL بدون تحديد المسار DEVICE_TREE_PATH (مثل device/brand/codename)."
+            MISSING=1
+          fi
+
+          if [ "$MISSING" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: تفريغ المساحة وتوفير 90-100+ جيجابايت (Disk Cleanup)
+        run: |
+          echo "=== المساحة المتاحة قبل التنظيف ==="
+          df -h /
+
+          echo "1. حذف صور وحاويات Docker غير المستخدمة..."
+          sudo docker image prune --all --force || true
+          sudo docker system prune --all --volumes --force || true
+          sudo systemctl stop docker docker.socket containerd || true
+
+          echo "2. حذف حزم .NET و Android SDK الافتراضية والأدوات الضخمة غير اللازمة..."
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /var/lib/docker \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/lib/node_modules \
+            /usr/share/swift \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /opt/az \
+            "$AGENT_TOOLSDIRECTORY" || true
+
+          sudo apt-get clean
+          sudo journalctl --vacuum-time=1s || true
+
+          echo "=== المساحة المتاحة بعد التنظيف ==="
+          df -h /
+
+      - name: إعداد بيئة Ubuntu وتثبيت حزم البناء الأساسية (Setup Environment)
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32readline-dev lib32z1-dev \
+            libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop openjdk-17-jdk pngcrush python3 \
+            python3-pip python-is-python3 rsync schedtool squashfs-tools \
+            unzip xsltproc zip zlib1g-dev
+
+          # دعم التوافق مع مكتبات libncurses5/libtinfo5 لسلاسل أدوات AOSP القديمة والحديثة
+          if apt-cache show libncurses5 >/dev/null 2>&1; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libncurses5 lib32ncurses5-dev libtinfo5 || true
+          fi
+          if [ ! -e /usr/lib/x86_64-linux-gnu/libncurses.so.5 ] && [ -e /usr/lib/x86_64-linux-gnu/libncurses.so.6 ]; then
+            sudo ln -sf /usr/lib/x86_64-linux-gnu/libncurses.so.6 /usr/lib/x86_64-linux-gnu/libncurses.so.5
+          fi
+          if [ ! -e /usr/lib/x86_64-linux-gnu/libtinfo.so.5 ] && [ -e /usr/lib/x86_64-linux-gnu/libtinfo.so.6 ]; then
+            sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+          fi
+
+          # تثبيت أداة Google Repo الرسمية
+          sudo curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
+
+          # إعداد هوية Git لتجنب توقف repo init أثناء التشغيل التلقائي
+          git config --global user.name "AOSP GitHub Builder"
+          git config --global user.email "builder@users.noreply.github.com"
+          git config --global color.ui false
+          git lfs install
+
+          # إعداد ccache لتسريع البناء
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          ccache -M 10G
+
+          # عرض إصدارات الأدوات المثبتة للتأكد
+          java -version
+          python3 --version
+          repo --version || true
+
+      - name: تهيئة المانيفست والمزامنة الخفيفة (Repo Init & Shallow Sync)
+        run: |
+          mkdir -p "$WORK_DIR"
+          cd "$WORK_DIR"
+
+          echo "=== تهيئة مستودع الروم (Repo Init) ==="
+          repo init \
+            --depth=1 \
+            --no-repo-verify \
+            -u "$FINAL_MANIFEST_URL" \
+            -b "$FINAL_MANIFEST_BRANCH" \
+            -g default,-mips,-darwin,-notdefault
+
+          echo "=== بدء المزامنة الخفيفة (Shallow Repo Sync) ==="
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle --depth=1 || \
+            repo sync -c -j4 --no-tags --no-clone-bundle --depth=1 --force-sync
+
+          df -h /
+
+      - name: تحميل شجرة الجهاز والملحقات (Clone Device, Vendor & Kernel Trees)
+        env:
+          CLEAN_REPO: ${{ inputs.clean_repo_after_sync }}
+        run: |
+          cd "$WORK_DIR"
+
+          clone_tree() {
+            local url="$1"
+            local branch="$2"
+            local path="$3"
+            local label="$4"
+
+            if [ -n "$url" ] && [ -n "$path" ]; then
+              echo "=== جاري استنساخ ${label} إلى ${path} ==="
+              rm -rf "$path"
+              if [ -n "$branch" ]; then
+                git clone --depth=1 --single-branch -b "$branch" "$url" "$path"
+              else
+                git clone --depth=1 --single-branch "$url" "$path"
+              fi
+            fi
+          }
+
+          clone_tree "$FINAL_DEVICE_URL" "$DEVICE_TREE_BRANCH" "$FINAL_DEVICE_PATH" "Device Tree"
+          clone_tree "$VENDOR_TREE_URL" "$VENDOR_TREE_BRANCH" "$VENDOR_TREE_PATH" "Vendor Tree"
+          clone_tree "$KERNEL_TREE_URL" "$KERNEL_TREE_BRANCH" "$KERNEL_TREE_PATH" "Kernel Tree"
+
+          # خيار إضافي لتوفير ~25-35GB بعد اكتمال المزامنة إذا تم تفعيله
+          if [ "$CLEAN_REPO" = "true" ]; then
+            echo "=== حذف مجلد .repo لتوفير مساحة إضافية للبناء ==="
+            rm -rf .repo
+          fi
+
+          df -h /
+
+      - name: بدء بناء الروم (Lunch & Compile ROM)
+        run: |
+          cd "$WORK_DIR"
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          export ALLOW_MISSING_DEPENDENCIES=true
+
+          # تعطيل الإيقاف التلقائي مؤقتاً لأن envsetup.sh قد يُرجع أكواد فحص غير صفرية طبيعية
+          set +e
+          source build/envsetup.sh
+          lunch "$FINAL_LUNCH_COMBO"
+          LUNCH_EXIT=$?
+          set -e
+
+          if [ "$LUNCH_EXIT" -ne 0 ]; then
+            echo "::error::فشل تنفيذ أمر lunch ($FINAL_LUNCH_COMBO). تأكد من صحة الاسم واكتمال شجرة الجهاز."
+            exit "$LUNCH_EXIT"
+          fi
+
+          echo "=== بدء عملية الترجمة (Target: $FINAL_BUILD_TARGET) ==="
+          if declare -F mka >/dev/null 2>&1; then
+            mka "$FINAL_BUILD_TARGET" -j$(nproc)
+          elif declare -F m >/dev/null 2>&1; then
+            m "$FINAL_BUILD_TARGET" -j$(nproc)
+          else
+            make "$FINAL_BUILD_TARGET" -j$(nproc)
+          fi
+
+      - name: رفع ملف الروم إلى GoFile (اختياري)
+        if: success() && inputs.upload_to_gofile == true
+        run: |
+          ROM_ZIP=$(find "$WORK_DIR"/out/target/product -maxdepth 2 -type f -name "*.zip" ! -name "*ota*" | head -n 1)
+          if [ -z "$ROM_ZIP" ]; then
+            ROM_ZIP=$(find "$WORK_DIR"/out/target/product -maxdepth 2 -type f -name "*.zip" | head -n 1)
+          fi
+          if [ -n "$ROM_ZIP" ]; then
+            echo "=== جاري رفع $(basename "$ROM_ZIP") إلى GoFile ==="
+            RESPONSE=$(curl -sSL -F "file=@${ROM_ZIP}" https://upload.gofile.io/uploadfile)
+            echo "استجابة الرفع: $RESPONSE"
+          else
+            echo "::warning::لم يتم العثور على ملف الروم المضغوط (.zip) لرفعه."
+          fi
+
+      - name: رفع ملفات الروم الناتجة عبر GitHub Artifacts (Upload ROM Artifacts)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOSP-ROM-Output
+          path: |
+            ${{ env.WORK_DIR }}/out/target/product/*/*.zip
+            ${{ env.WORK_DIR }}/out/target/product/*/boot.img
+            ${{ env.WORK_DIR }}/out/target/product/*/recovery.img
+            ${{ env.WORK_DIR }}/out/target/product/*/vendor_boot.img
+          if-no-files-found: warn
+          retention-days: 7
