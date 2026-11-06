@@ -55,6 +55,18 @@ spec.loader.exec_module(mod)
 for fstab in pathlib.Path(".").rglob("fstab*"):
     if fstab.is_file():
         mod.patch_fstab_file(fstab, logical_parts, disable_dfe)
+
+# Ensure fstab.qcom exists for androidboot.hardware=qcom first-stage mount
+if pathlib.Path("fstab.default").is_file() and not pathlib.Path("fstab.qcom").exists():
+    import shutil
+    shutil.copy2("fstab.default", "fstab.qcom")
+    print("  [FSTAB] تم إنشاء fstab.qcom داخل ramdisk لضمان إقلاع المرحلة الأولى لـ qcom", flush=True)
+if pathlib.Path("fstab.qcom").is_file():
+    fsr = pathlib.Path("first_stage_ramdisk")
+    fsr.mkdir(exist_ok=True)
+    if not (fsr / "fstab.qcom").exists():
+        import shutil
+        shutil.copy2("fstab.qcom", fsr / "fstab.qcom")
 PYEOF
 
   sudo find . -mindepth 1 | LC_ALL=C sort | sudo cpio -o -H newc > ../ramdisk.cpio.new 2>/dev/null

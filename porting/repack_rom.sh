@@ -36,6 +36,10 @@ for part in "${PARTS[@]}"; do
     "${IMG_OUT}/${part}.img" \
     "${FINAL_DIR}/${part}"
 
+  # فحص سلامة صورة EROFS المولّدة قبل دمجها
+  fsck.erofs "${IMG_OUT}/${part}.img" >/dev/null
+  echo "     [FSCK] صورة ${part}.img اجتازت فحص سلامة EROFS بنجاح"
+
   # حذف المجلد المفكوك فور تحويله لتوفير مساحة القرص
   rm -rf "${FINAL_DIR:?}/${part}"
 

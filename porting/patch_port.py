@@ -246,6 +246,83 @@ def copy_hardware_overlays(base_product: Path, final_product: Path):
     print(f"  [OVERLAY] تم نقل {copied} من ملفات الـ Overlay الخاصة بعتاد joyeuse/miatoll", flush=True)
 
 
+def transplant_vndk_and_selinux_mappings(base_dir: Path, final_dir: Path):
+    """Transplant missing VNDK APEX (e.g. v30 for SM6250) and SELinux CIL mapping files from Base ROM."""
+    vendor_dir = final_dir / "vendor"
+    vndk_ver = "30"
+    for vp in (vendor_dir / "build.prop", vendor_dir / "default.prop"):
+        if vp.is_file():
+            for line in vp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.strip().startswith("ro.vndk.version="):
+                    val = line.split("=", 1)[1].strip()
+                    if val:
+                        vndk_ver = val
+                        break
+
+    final_sys_root = (final_dir / "system" / "system") if (final_dir / "system" / "system" / "build.prop").is_file() else (final_dir / "system")
+    base_sys_root = (base_dir / "system" / "system") if (base_dir / "system" / "system" / "build.prop").is_file() else (base_dir / "system")
+
+    # 1. Check & transplant com.android.vndk.v<VER>
+    target_apex_dir = final_dir / "system_ext" / "apex"
+    if not target_apex_dir.is_dir():
+        target_apex_dir = final_sys_root / "system_ext" / "apex"
+    target_apex_dir.mkdir(parents=True, exist_ok=True)
+
+    has_vndk = any(
+        f"vndk.v{vndk_ver}" in p.name or f"vndk.{vndk_ver}" in p.name
+        for d in (final_dir / "system_ext" / "apex", final_sys_root / "system_ext" / "apex", final_sys_root / "apex")
+        if d.is_dir()
+        for p in d.iterdir()
+    )
+    if not has_vndk:
+        for src_d in (base_dir / "system_ext" / "apex", base_sys_root / "system_ext" / "apex", base_sys_root / "apex"):
+            if not src_d.is_dir():
+                continue
+            for cand in src_d.iterdir():
+                if f"vndk.v{vndk_ver}" in cand.name or f"vndk.{vndk_ver}" in cand.name:
+                    dest = target_apex_dir / cand.name
+                    if cand.is_dir():
+                        shutil.copytree(cand, dest, symlinks=True)
+                    else:
+                        shutil.copy2(cand, dest, follow_symlinks=False)
+                    # Also carry over exact SELinux file_contexts & fs_config entries (e.g. vndk_sp_file) from Base
+                    for suffix in ("fs_config", "file_contexts"):
+                        b_cfg = base_dir / "config" / f"system_ext_{suffix}"
+                        f_cfg = final_dir / "config" / f"system_ext_{suffix}"
+                        if b_cfg.is_file() and f_cfg.is_file():
+                            existing = set(f_cfg.read_text(encoding="utf-8", errors="ignore").splitlines())
+                            extra = [
+                                ln for ln in b_cfg.read_text(encoding="utf-8", errors="ignore").splitlines()
+                                if (cand.name in ln or re.escape(cand.name) in ln) and ln not in existing
+                            ]
+                            if extra:
+                                with open(f_cfg, "a", encoding="utf-8") as out_f:
+                                    out_f.write("\n".join(extra) + "\n")
+                    print(f"  [VNDK] تم زرع حزمة التوافق المفقودة {cand.name} (+ سياقات SELinux) من الروم الأساسي لمنع الـ Bootloop!", flush=True)
+                    has_vndk = True
+                    break
+            if has_vndk:
+                break
+
+    # 2. Check & transplant SELinux mapping/<vers>.cil across system, system_ext, product
+    vers_txt = vendor_dir / "etc" / "selinux" / "plat_sepolicy_vers.txt"
+    vers = vers_txt.read_text(encoding="utf-8", errors="ignore").strip() if vers_txt.is_file() else f"{vndk_ver}.0"
+    pairs = [
+        ("system", base_sys_root / "etc" / "selinux" / "mapping", final_sys_root / "etc" / "selinux" / "mapping"),
+        ("system_ext", base_dir / "system_ext" / "etc" / "selinux" / "mapping", final_dir / "system_ext" / "etc" / "selinux" / "mapping"),
+        ("product", base_dir / "product" / "etc" / "selinux" / "mapping", final_dir / "product" / "etc" / "selinux" / "mapping"),
+    ]
+    for label, b_map, f_map in pairs:
+        if not b_map.is_dir():
+            continue
+        f_map.mkdir(parents=True, exist_ok=True)
+        for cand in b_map.glob(f"{vers}*"):
+            dest = f_map / cand.name
+            if not dest.exists() and cand.is_file():
+                shutil.copy2(cand, dest)
+                print(f"  [SELINUX-MAP] تم زرع ملف ربط السياسة {label}/mapping/{cand.name} من الروم الأساسي", flush=True)
+
+
 def run_smart_debloat(final_dir: Path):
     removed_bytes = 0
     removed_count = 0
@@ -333,6 +410,8 @@ def reconcile_selinux_configs(part_dir: Path, config_dir: Path, part_name: str):
                     parent = str(Path(parent).parent)
                 if "/etc/init/" in fc_key and fc_key.endswith(".rc"):
                     inherited_ctx = "u:object_r:vendor_configs_file:s0" if part_name == "vendor" else "u:object_r:system_file:s0"
+                elif "/etc/selinux/" in fc_key and fc_key.endswith(".cil"):
+                    inherited_ctx = "u:object_r:sepolicy_file:s0"
                 new_fc_lines.append(f"/{re.escape(part_name)}/{re.escape(rel)} {inherited_ctx}")
                 known_fc_map[fc_key] = inherited_ctx
 
@@ -399,9 +478,10 @@ def main():
     ui_type = detect_ui_type(final_dir, args.ui_type)
     print(f"=== نوع الواجهة المكتشفة للبورت: [{ui_type.upper()}] | البارتيشنات: {final_parts} ===", flush=True)
 
-    # 3. Copy hardware overlays from base/product to final/product
+    # 3. Copy hardware overlays + transplant missing VNDK APEX & SELinux mapping CILs from Base
     if (base_dir / "product").is_dir() and (final_dir / "product").is_dir():
         copy_hardware_overlays(base_dir / "product", final_dir / "product")
+    transplant_vndk_and_selinux_mappings(base_dir, final_dir)
 
     # 4. HyperOS joyeuse device_features XML
     if ui_type == "hyperos" and (final_dir / "product").is_dir():
@@ -414,7 +494,8 @@ def main():
         print("  [HYPEROS] تم تجهيز ملفات خصائص joyeuse/miatoll (بصمة جانبية + NFC + IR + بطارية 5020mAh)", flush=True)
 
     # 5. Free base_dir & port_dir (keep base/firmware for boot/dtbo/vbmeta)
-    shutil.rmtree(base_dir / "product", ignore_errors=True)
+    for bcleanup in ("product", "system_ext", "system", "odm"):
+        shutil.rmtree(base_dir / bcleanup, ignore_errors=True)
     shutil.rmtree(port_dir, ignore_errors=True)
 
     # 6. Patch fstab in vendor & odm for EROFS + logical partitions + no AVB
@@ -465,7 +546,18 @@ def main():
     if args.enable_debloat.lower() == "true":
         run_smart_debloat(final_dir)
 
-    # 10. Reconcile fs_config & file_contexts for every partition
+    # 10. Pre-compile & auto-heal SELinux split CIL policies via secilc before sealing fs_config
+    if shutil.which("secilc"):
+        import importlib.util
+        sim_spec = importlib.util.spec_from_file_location("simulate_boot_check", str(Path(__file__).parent / "simulate_boot_check.py"))
+        sim_mod = importlib.util.module_from_spec(sim_spec)
+        sim_spec.loader.exec_module(sim_mod)
+        ok_cil, cil_msg = sim_mod.heal_and_compile_selinux(final_dir)
+        print(f"  [SECILC] {cil_msg}", flush=True)
+        if not ok_cil:
+            raise RuntimeError(cil_msg)
+
+    # 11. Reconcile fs_config & file_contexts for every partition
     for part in final_parts:
         reconcile_selinux_configs(final_dir / part, final_cfg, part)
 

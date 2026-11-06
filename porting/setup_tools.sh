@@ -4,9 +4,9 @@ set -euo pipefail
 echo "=== [1/3] تثبيت الحزم الأساسية لبيئة البورت (APT Packages) ==="
 sudo apt-get update -y
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  aria2 attr bc bison brotli build-essential cpio curl e2fsprogs \
-  file flex git jq libelf-dev libssl-dev lz4 p7zip-full python3 \
-  rsync unzip zip zstd
+  aria2 attr bc binutils bison brotli build-essential cpio curl \
+  device-tree-compiler e2fsprogs file flex git jq libelf-dev libssl-dev \
+  lz4 p7zip-full python3 qemu-user-static rsync secilc unzip zip zstd
 
 BIN_DIR="/usr/local/bin"
 TMP_TOOLS="$(mktemp -d)"

@@ -177,6 +177,12 @@ jobs:
             "$K_URL" \
             "$D_DFE"
 
+      - name: محاكاة الإقلاع المسبق ومنع الـ Bootloop (Pre-Boot Simulation)
+        run: |
+          python3 "$GITHUB_WORKSPACE/porting/simulate_boot_check.py" \
+            --workdir "$PORT_WORKDIR" \
+            --phase pre-repack
+
       - name: ضغط EROFS وتجميع super.img والملف النهائي للتفليش (Repack ROM)
         env:
           R_NAME: ${{ inputs.rom_name }}
@@ -184,6 +190,12 @@ jobs:
           "$GITHUB_WORKSPACE/porting/repack_rom.sh" \
             "$PORT_WORKDIR" \
             "$R_NAME"
+
+      - name: محاكاة التفليش وفحص الحزمة النهائية (Flash Package Simulation)
+        run: |
+          python3 "$GITHUB_WORKSPACE/porting/simulate_boot_check.py" \
+            --workdir "$PORT_WORKDIR" \
+            --phase post-repack
 
       - name: رفع الروم إلى GoFile وعرض رابط التحميل المباشر (Upload ROM)
         if: success()

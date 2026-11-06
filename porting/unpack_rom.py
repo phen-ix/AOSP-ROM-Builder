@@ -24,7 +24,7 @@ SPARSE_MAGIC = 0xED26FF3A
 EROFS_MAGIC = 0xE0F5E1E2
 EXT4_MAGIC = 0xEF53
 
-BASE_LOGICAL_PARTS = ["vendor", "odm", "product"]
+BASE_LOGICAL_PARTS = ["vendor", "odm", "product", "system_ext", "system"]
 BASE_FIRMWARE_IMGS = ["boot", "dtbo", "vbmeta", "vbmeta_system", "vbmeta_vendor"]
 
 PORT_LOGICAL_PARTS = [
