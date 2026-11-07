@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       rom_name:
-        description: "اسم الروم/الواجهة (مثال: HyperOS-2.0 أو OxygenOS-16 أو Lunaris-3.13)"
+        description: "اسم الروم/الواجهة (افتراضياً: HyperOS 3.0 Android 16 من Redmi Note 15 5G Global)"
         required: true
-        default: "OEM-Port"
+        default: "HyperOS-3.0-A16-KunziteGlobal"
         type: string
       base_rom_url:
-        description: "رابط الروم الأساسي لهاتف miatoll/joyeuse (افتراضياً: MiatollCave 2026-11-06 المحدث)"
+        description: "رابط الروم الأساسي لهاتف miatoll/joyeuse (افتراضياً: MiatollCave 64-bit-only المحدث)"
         required: true
         default: "https://pixeldrain.com/api/file/TS1cn1RH"
         type: string
       port_rom_url:
-        description: "رابط روم الواجهة الكاملة المراد سحب النظام منها (Port ROM URL)"
+        description: "رابط روم الواجهة الكاملة المراد سحب النظام منها (افتراضياً: kunzite Global OS3.0.304.0.WPQMIXM Android 16)"
         required: true
-        default: ""
+        default: "https://cdnorg.d.miui.com/OS3.0.304.0.WPQMIXM/kunzite_global-ota_full-OS3.0.304.0.WPQMIXM-user-16.0-d4997b08a5.zip"
         type: string
       ui_type:
         description: "نوع الواجهة المراد عمل بورت لها"
@@ -148,8 +148,17 @@ jobs:
           if [[ "$PORT_URL" == *".tgz"* ]] || [[ "$PORT_URL" == *".tar.gz"* ]]; then
             PORT_EXT=".tgz"
           fi
-          aria2c -x8 -s8 --file-allocation=none --check-certificate=false -d "$PORT_WORKDIR/downloads" -o "port_rom${PORT_EXT}" "$PORT_URL" \
-            || curl -fSL --retry 3 "$PORT_URL" -o "$PORT_WORKDIR/downloads/port_rom${PORT_EXT}"
+          PORT_ARIA="-x16 -s16"
+          [[ "$PORT_URL" == *"pixeldrain.com"* ]] && PORT_ARIA="-x4 -s4"
+          if ! aria2c $PORT_ARIA --file-allocation=none --check-certificate=false -d "$PORT_WORKDIR/downloads" -o "port_rom${PORT_EXT}" "$PORT_URL"; then
+            if [[ "$PORT_URL" == *"cdnorg.d.miui.com"* ]]; then
+              ALT_URL="${PORT_URL/cdnorg.d.miui.com/bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com}"
+              aria2c -x16 -s16 --file-allocation=none --check-certificate=false -d "$PORT_WORKDIR/downloads" -o "port_rom${PORT_EXT}" "$ALT_URL" \
+                || curl -fSL --retry 3 "$ALT_URL" -o "$PORT_WORKDIR/downloads/port_rom${PORT_EXT}"
+            else
+              curl -fSL --retry 3 "$PORT_URL" -o "$PORT_WORKDIR/downloads/port_rom${PORT_EXT}"
+            fi
+          fi
 
           python3 "$GITHUB_WORKSPACE/porting/unpack_rom.py" \
             --input "$PORT_WORKDIR/downloads/port_rom${PORT_EXT}" \

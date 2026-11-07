@@ -16,6 +16,10 @@ import os
 import re
 import shutil
 import stat
+import struct
+import subprocess
+import tempfile
+import zipfile
 from pathlib import Path
 
 SAFE_DEBLOAT_KEYWORDS = [
@@ -26,7 +30,7 @@ SAFE_DEBLOAT_KEYWORDS = [
     "Taobao", "JD", "Meituan", "BrowserVideo", "MiCredit", "PaymentService",
     "HeytapBrowser", "HeytapMarket", "KeKeMarket", "NearmeGameCenter", "OppoShop",
     # Xiaomi Global Bloat, Ads & Crashing Services
-    "Joyose", "MiLink", "Lyra", "uceShimService", "CatchLog", "MiBugReport",
+    "Joyose", "MiLink", "Lyra", "uceShimService", "NtnSatApp", "CatchLog", "MiBugReport",
     "MIService", "MIUIYellowPage", "MITSMClient", "MIUIMiPicks", "MiPicks",
     "MIBrowser", "BrowserGlobal", "MIUIMusic", "MIUIVideo", "MiVideo",
     "GlobalWPSLITE", "WPSOffice", "MISTORE_OVERSEA", "MICOMMUNITY", "PocoBBS",
@@ -293,17 +297,536 @@ def copy_hardware_overlays(base_product: Path, final_product: Path):
     print(f"  [OVERLAY] إجمالي ملفات الـ Overlay المنقولة لعتاد joyeuse/miatoll = {copied}", flush=True)
 
 
+def get_partition_sdk(sys_root: Path) -> int:
+    bp = sys_root / "build.prop"
+    if bp.is_file():
+        for ln in bp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ln.startswith("ro.build.version.sdk="):
+                try:
+                    return int(ln.split("=", 1)[1].strip())
+                except ValueError:
+                    return 0
+    return 0
+
+
+def is_64bit_only_system(sys_root: Path) -> bool:
+    bp = sys_root / "build.prop"
+    if not bp.is_file():
+        return False
+    txt = bp.read_text(encoding="utf-8", errors="ignore")
+    for ln in txt.splitlines():
+        if ln.startswith("ro.system.product.cpu.abilist32="):
+            return ln.split("=", 1)[1].strip() == ""
+    return not os.path.lexists(sys_root / "bin" / "linker") and os.path.lexists(sys_root / "bin" / "linker64")
+
+
+def collect_exported_elf_symbols(final_dir: Path, is_64: bool = True) -> tuple[set[str], set[str]]:
+    """Return (available_sonames, exported_symbol_names) across final system/system_ext/product/apex libs."""
+    readelf = shutil.which("readelf")
+    sys_root = (final_dir / "system" / "system") if (final_dir / "system" / "system" / "build.prop").is_file() else (final_dir / "system")
+    lib_sub = "lib64" if is_64 else "lib"
+    search_dirs = [
+        sys_root / lib_sub,
+        sys_root / lib_sub / "bootstrap",
+        final_dir / "system_ext" / lib_sub,
+        final_dir / "product" / lib_sub,
+        final_dir / "vendor" / lib_sub,
+    ]
+    for apex_root in (sys_root / "apex", final_dir / "system_ext" / "apex"):
+        if apex_root.is_dir():
+            for sub in apex_root.iterdir():
+                if sub.is_dir() and (sub / lib_sub).is_dir():
+                    search_dirs.append(sub / lib_sub)
+
+    sonames: set[str] = {
+        "libc.so", "libm.so", "libdl.so", "libdl_android.so", "ld-android.so",
+    }
+    exported: set[str] = set()
+    if not readelf:
+        return sonames, exported
+
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for so in d.rglob("*.so"):
+            if not so.is_file():
+                continue
+            sonames.add(so.name)
+            res = subprocess.run([readelf, "--dyn-syms", "-W", str(so)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            for ln in (res.stdout or "").splitlines():
+                cols = ln.split()
+                if len(cols) >= 8 and cols[6] != "UND":
+                    sym = cols[7].split("@")[0]
+                    if sym:
+                        exported.add(sym)
+    return sonames, exported
+
+
+def elf_und_symbols_resolvable(cand_so: Path, avail_sonames: set[str], exported_syms: set[str]) -> tuple[bool, list[str]]:
+    """Verify every DT_NEEDED library and non-Bionic UND symbol in cand_so resolves cleanly in final."""
+    readelf = shutil.which("readelf")
+    if not readelf or not cand_so.is_file():
+        return False, ["readelf unavailable or candidate missing"]
+
+    d_res = subprocess.run([readelf, "-d", "-W", str(cand_so)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    needed = re.findall(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]", d_res.stdout or "")
+    missing_libs = [lib for lib in needed if lib not in avail_sonames]
+    if missing_libs:
+        return False, [f"missing DT_NEEDED: {missing_libs}"]
+
+    s_res = subprocess.run([readelf, "--dyn-syms", "-W", str(cand_so)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    bionic_tags = ("@LIBC", "@LIBM", "@LIBDL")
+    unresolved = []
+    for ln in (s_res.stdout or "").splitlines():
+        cols = ln.split()
+        if len(cols) >= 8 and cols[6] == "UND" and cols[4] != "WEAK":
+            raw_sym = cols[7]
+            if any(t in raw_sym for t in bionic_tags):
+                continue
+            sym = raw_sym.split("@")[0]
+            if sym and sym not in exported_syms:
+                unresolved.append(sym)
+    return len(unresolved) == 0, unresolved
+
+
+def extract_file_from_apex(apex_path: Path, inner_rel_path: str) -> bytes | None:
+    """Read a file (e.g. 'bin/netbpfload') from an unpacked APEX dir, .apex, or .capex WITHOUT modifying the APEX."""
+    rel_clean = inner_rel_path.lstrip("/")
+    if apex_path.is_dir():
+        cand = apex_path / rel_clean
+        return cand.read_bytes() if cand.is_file() else None
+    if not apex_path.is_file() or not zipfile.is_zipfile(apex_path):
+        return None
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        outer_zip = apex_path
+        with zipfile.ZipFile(outer_zip, "r") as zf:
+            names = zf.namelist()
+            if "original_apex" in names:
+                zf.extract("original_apex", td_path)
+                outer_zip = td_path / "original_apex"
+
+        with zipfile.ZipFile(outer_zip, "r") as zf:
+            if "apex_payload.img" not in zf.namelist():
+                return None
+            zf.extract("apex_payload.img", td_path)
+
+        payload_img = td_path / "apex_payload.img"
+        with open(payload_img, "rb") as pf:
+            pf.seek(1024)
+            is_erofs = pf.read(4) == b"\xe2\xe1\xf5\xe0"
+
+        if is_erofs:
+            if shutil.which("dump.erofs"):
+                res = subprocess.run(
+                    ["dump.erofs", "--cat", f"--path=/{rel_clean}", str(payload_img)],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                if res.returncode == 0 and res.stdout:
+                    return res.stdout
+            if shutil.which("extract.erofs"):
+                ex_dir = td_path / "ex"
+                subprocess.run(
+                    ["extract.erofs", "-i", str(payload_img), "-o", str(ex_dir), "-x"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                cand = ex_dir / rel_clean
+                if cand.is_file():
+                    return cand.read_bytes()
+        elif shutil.which("debugfs") or Path("/usr/sbin/debugfs").is_file():
+            debugfs_bin = shutil.which("debugfs") or "/usr/sbin/debugfs"
+            out_f = td_path / "extracted_bin"
+            subprocess.run(
+                [debugfs_bin, "-R", f"dump /{rel_clean} {out_f}", str(payload_img)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if out_f.is_file() and out_f.stat().st_size > 0:
+                return out_f.read_bytes()
+    return None
+
+
+def patch_netbpfload_bytes(raw: bytes) -> tuple[bytes, list[str]]:
+    """Patch BOTH Android 16 netbpfload kernel version gates (4.19 & 5.4) to ARM64 NOP (1f 20 03 d5)."""
+    if len(raw) < 64 or raw[:4] != b"\x7fELF" or raw[4] != 2 or struct.unpack_from("<H", raw, 18)[0] != 183:
+        raise RuntimeError("ملف netbpfload ليس ملف ELF64 AArch64 صالحاً!")
+
+    ARM64_NOP = b"\x1f\x20\x03\xd5"
+    buf = bytearray(raw)
+    patched_sites: list[str] = []
+
+    # 1. Exact audited Android 16 (OS3.0.304.0.WPQMIXM) dual-gate offsets:
+    #    0xdcf0: 69 17 00 54 (b.ls 0xdfdc -> "Android V requires kernel 4.19.")
+    #    0xdd14: e0 16 00 36 (tbz w0, #0, 0xdff0 -> "Android 25Q2 requires kernel 5.4.")
+    if (
+        len(buf) > 0xdd18
+        and bytes(buf[0xdcf0:0xdcf4]) == b"\x69\x17\x00\x54"
+        and bytes(buf[0xdd14:0xdd18]) == b"\xe0\x16\x00\x36"
+    ):
+        buf[0xdcf0:0xdcf4] = ARM64_NOP
+        buf[0xdd14:0xdd18] = ARM64_NOP
+        patched_sites.extend(["0xdcf0(b.ls->4.19)", "0xdd14(tbz->5.4)"])
+        return bytes(buf), patched_sites
+
+    # 2. General AArch64 ELF CFG scanner for future HyperOS 3 / Android 16 builds
+    e_phoff = struct.unpack_from("<Q", raw, 32)[0]
+    e_phentsize, e_phnum = struct.unpack_from("<HH", raw, 54)
+    loads = []
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        p_type, p_flags, p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack_from("<IIQQQQQQ", raw, off)
+        if p_type == 1:  # PT_LOAD
+            loads.append((p_offset, p_vaddr, p_filesz, p_flags))
+
+    def foff_to_va(foff: int) -> int | None:
+        for p_off, p_va, p_fsz, _ in loads:
+            if p_off <= foff < p_off + p_fsz:
+                return p_va + (foff - p_off)
+        return None
+
+    def va_to_foff(va: int) -> int | None:
+        for p_off, p_va, p_fsz, _ in loads:
+            if p_va <= va < p_va + p_fsz:
+                return p_off + (va - p_va)
+        return None
+
+    gate_Needles = [
+        ("4.19", b"requires kernel 4.19"),
+        ("5.4", b"requires kernel 5.4"),
+    ]
+    for label, needle in gate_Needles:
+        idx = raw.find(needle)
+        if idx < 0:
+            continue
+        # Walk back to start of C string
+        s_start = raw.rfind(b"\x00", 0, idx) + 1
+        str_va = foff_to_va(s_start)
+        if str_va is None:
+            continue
+
+        # Scan executable PT_LOAD segments for ADRP + ADD referencing str_va
+        err_vas = []
+        for p_off, p_va, p_fsz, p_flags in loads:
+            if not (p_flags & 1):  # PF_X
+                continue
+            for pos in range(p_off, p_off + p_fsz - 8, 4):
+                insn1, insn2 = struct.unpack_from("<II", raw, pos)
+                if (insn1 & 0x9F000000) == 0x90000000:  # ADRP
+                    rd = insn1 & 0x1F
+                    immlo = (insn1 >> 29) & 0x3
+                    immhi = (insn1 >> 5) & 0x7FFFF
+                    imm = (immhi << 2) | immlo
+                    if imm & (1 << 20):
+                        imm -= 1 << 21
+                    pc = p_va + (pos - p_off)
+                    page = (pc & ~0xFFF) + (imm << 12)
+                    if page == (str_va & ~0xFFF) and (insn2 & 0xFFC00000) == 0x91000000:  # ADD imm12
+                        rn = (insn2 >> 5) & 0x1F
+                        imm12 = (insn2 >> 10) & 0xFFF
+                        if rn == rd and (page + imm12) == str_va:
+                            err_vas.append(pc)
+
+        for err_va in err_vas:
+            # Error basic block starts up to 16 bytes before ADRP (e.g. mov w0, #7 log level)
+            bb_min, bb_max = err_va - 20, err_va + 4
+            scan_start_foff = max(0, (va_to_foff(err_va) or 0) - 0x1000)
+            scan_end_foff = va_to_foff(err_va) or 0
+            for pos in range(scan_start_foff & ~3, scan_end_foff, 4):
+                pc = foff_to_va(pos)
+                if pc is None:
+                    continue
+                insn = struct.unpack_from("<I", buf, pos)[0]
+                target = None
+                if (insn & 0xFF000010) == 0x54000000:  # B.cond
+                    imm19 = (insn >> 5) & 0x7FFFF
+                    if imm19 & (1 << 18):
+                        imm19 -= 1 << 19
+                    target = pc + (imm19 << 2)
+                elif (insn & 0x7E000000) == 0x34000000:  # CBZ / CBNZ
+                    imm19 = (insn >> 5) & 0x7FFFF
+                    if imm19 & (1 << 18):
+                        imm19 -= 1 << 19
+                    target = pc + (imm19 << 2)
+                elif (insn & 0x7E000000) == 0x36000000:  # TBZ / TBNZ
+                    imm14 = (insn >> 5) & 0x3FFF
+                    if imm14 & (1 << 13):
+                        imm14 -= 1 << 14
+                    target = pc + (imm14 << 2)
+                if target is not None and bb_min <= target <= bb_max:
+                    buf[pos : pos + 4] = ARM64_NOP
+                    patched_sites.append(f"0x{pos:x}(->{label})")
+
+    if len(patched_sites) < 2:
+        raise RuntimeError(f"تعذر العثور على بوابتي فحص الكيرنل (4.19 و 5.4) داخل netbpfload (تم العثور على: {patched_sites})")
+    return bytes(buf), patched_sites
+
+
+def patch_android16_netbpfload_for_414(final_dir: Path):
+    """Apply clean bind-mount bypass for Android 16 (SDK 36+) netbpfload on Linux 4.14 without touching APEX signatures."""
+    final_sys = (final_dir / "system" / "system") if (final_dir / "system" / "system" / "build.prop").is_file() else (final_dir / "system")
+    f_sdk = get_partition_sdk(final_sys)
+    if f_sdk < 36:
+        return
+
+    print(f"=== [ANDROID-16] تطبيق حل netbpfload_414 النظيف لنواة 4.14 (SDK {f_sdk}) ===", flush=True)
+    apex_dir = final_sys / "apex"
+    tethering_apex = None
+    if apex_dir.is_dir():
+        for cand in sorted(apex_dir.iterdir()):
+            if "tethering" in cand.name.lower():
+                tethering_apex = cand
+                break
+    if not tethering_apex:
+        raise RuntimeError("تعذر العثور على حزمة com.android.tethering داخل system/apex في روم Android 16!")
+
+    raw_netbpfload = extract_file_from_apex(tethering_apex, "bin/netbpfload")
+    if not raw_netbpfload:
+        raise RuntimeError(f"تعذر استخراج bin/netbpfload من {tethering_apex.name}!")
+
+    patched_bytes, patched_sites = patch_netbpfload_bytes(raw_netbpfload)
+    dst_bin = final_sys / "bin" / "netbpfload_414"
+    dst_bin.parent.mkdir(parents=True, exist_ok=True)
+    dst_bin.write_bytes(patched_bytes)
+    dst_bin.chmod(0o755)
+    print(f"  [BPF-FIX] تم استخراج وترقيع البوابتين {patched_sites} إلى NOP في {dst_bin} دون المساس بتوقيع {tethering_apex.name}", flush=True)
+
+    # Register exact SELinux bpfloader_exec label & 0755 mode for /system/.../bin/netbpfload_414
+    sys_part_root = final_dir / "system"
+    rel_to_part = dst_bin.relative_to(sys_part_root).as_posix()
+    fs_cfg = final_dir / "config" / "system_fs_config"
+    fc_cfg = final_dir / "config" / "system_file_contexts"
+    if fs_cfg.is_file():
+        fs_entry = f"system/{rel_to_part} 0 2000 0755"
+        txt = fs_cfg.read_text(encoding="utf-8", errors="ignore")
+        if f"system/{rel_to_part} " not in txt:
+            with open(fs_cfg, "a", encoding="utf-8") as f:
+                f.write(fs_entry + "\n")
+    if fc_cfg.is_file():
+        escaped_key = f"/system/{re.escape(rel_to_part)}"
+        fc_entry = f"{escaped_key} u:object_r:bpfloader_exec:s0"
+        txt = fc_cfg.read_text(encoding="utf-8", errors="ignore")
+        if escaped_key not in txt and f"/system/{rel_to_part} " not in txt:
+            with open(fc_cfg, "a", encoding="utf-8") as f:
+                f.write(fc_entry + "\n")
+
+    # Allow init to bind-mount over bpfloader_exec in plat_sepolicy.cil
+    plat_cil = final_sys / "etc" / "selinux" / "plat_sepolicy.cil"
+    mounton_rule = "(allow init bpfloader_exec (file (mounton)))"
+    if plat_cil.is_file():
+        cil_txt = plat_cil.read_text(encoding="utf-8", errors="ignore")
+        if mounton_rule not in cil_txt:
+            with open(plat_cil, "a", encoding="utf-8") as f:
+                f.write(f"\n{mounton_rule}\n")
+            print(f"  [BPF-SELINUX] تمت إضافة {mounton_rule} في plat_sepolicy.cil", flush=True)
+
+    # Inject bind-mount right before `exec_start bpfloader` in init.rc (keep netbpfload.rc header untouched!)
+    init_rc = final_sys / "etc" / "init" / "hw" / "init.rc"
+    bind_line = "    mount none /system/bin/netbpfload_414 /apex/com.android.tethering/bin/netbpfload bind"
+    if init_rc.is_file():
+        rc_txt = init_rc.read_text(encoding="utf-8", errors="ignore")
+        if bind_line not in rc_txt:
+            new_rc, n_sub = re.subn(
+                r"^(\s*exec_start\s+bpfloader\b)",
+                f"{bind_line}\n\\1",
+                rc_txt,
+                count=1,
+                flags=re.MULTILINE,
+            )
+            if n_sub == 0:
+                raise RuntimeError("تعذر العثور على سطر `exec_start bpfloader` داخل init.rc!")
+            init_rc.write_text(new_rc, encoding="utf-8")
+            print("  [BPF-INIT] تم حقن الربط (bind-mount) لـ netbpfload_414 قبل exec_start bpfloader في init.rc", flush=True)
+
+
+def fix_joyeuse_nxp_nfc(base_dir: Path, final_dir: Path, only_64bit: bool):
+    """Purge conflicting STMicroelectronics NFC (kunzite) and transplant joyeuse NXP NFC (NQNfcNci) with clean oat/."""
+    # 1. Purge STMicroelectronics NFC APKs & JNI libs (keep framework/*.jar untouched to preserve BOOTCLASSPATH)
+    st_removed = 0
+    app_roots = [
+        final_dir / "system" / "system" / "app",
+        final_dir / "system" / "system" / "priv-app",
+        final_dir / "system" / "app",
+        final_dir / "system" / "priv-app",
+        final_dir / "system_ext" / "app",
+        final_dir / "system_ext" / "priv-app",
+        final_dir / "product" / "app",
+        final_dir / "product" / "priv-app",
+    ]
+    st_app_patterns = ("nfc_st", "nfcst", "stnfcextension", "stnfc")
+    for ar in app_roots:
+        if not ar.is_dir():
+            continue
+        for entry in list(ar.iterdir()):
+            low = entry.name.lower()
+            if any(pat in low for pat in st_app_patterns):
+                shutil.rmtree(entry, ignore_errors=True) if entry.is_dir() else entry.unlink(missing_ok=True)
+                st_removed += 1
+
+    for lib_dir in (
+        final_dir / "system" / "system" / "lib64",
+        final_dir / "system_ext" / "lib64",
+        final_dir / "product" / "lib64",
+    ):
+        if lib_dir.is_dir():
+            for so in list(lib_dir.glob("*nfc*st*.so")) + list(lib_dir.glob("*st21nfc*.so")) + list(lib_dir.glob("*stnfc*.so")):
+                so.unlink(missing_ok=True)
+                st_removed += 1
+
+    if st_removed:
+        print(f"  [NFC-CLEAN] تم تطهير {st_removed} حزمة/مكتبة STMicroelectronics NFC متعارضة مع شريحة NXP في joyeuse", flush=True)
+
+    # 2. Transplant NXP NQNfcNci* app from Base if missing in Final, and ALWAYS strip stale oat/
+    base_sys = (base_dir / "system" / "system") if (base_dir / "system" / "system" / "build.prop").is_file() else (base_dir / "system")
+    final_sys = (final_dir / "system" / "system") if (final_dir / "system" / "system" / "build.prop").is_file() else (final_dir / "system")
+
+    part_pairs = [
+        ("system", base_sys, final_sys),
+        ("system_ext", base_dir / "system_ext", final_dir / "system_ext"),
+        ("product", base_dir / "product", final_dir / "product"),
+    ]
+
+    has_nqnfc = any(
+        "nqnfcnci" in p.name.lower()
+        for _, _, f_root in part_pairs
+        for sub in ("app", "priv-app")
+        if (f_root / sub).is_dir()
+        for p in (f_root / sub).iterdir()
+    )
+
+    if not has_nqnfc:
+        for label, b_root, f_root in part_pairs:
+            for sub in ("app", "priv-app"):
+                b_sub = b_root / sub
+                if not b_sub.is_dir():
+                    continue
+                for cand in b_sub.iterdir():
+                    if "nqnfcnci" in cand.name.lower() and cand.is_dir():
+                        dst = f_root / sub / cand.name
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copytree(cand, dst, symlinks=True, dirs_exist_ok=True)
+                        shutil.rmtree(dst / "oat", ignore_errors=True)
+                        print(f"  [NFC-NXP] تم زرع {cand.name} في {label}/{sub} (مع حذف oat/ القديم للتوافق مع ART الجديد)", flush=True)
+                        has_nqnfc = True
+
+    # Also ensure any existing NQNfcNci in final from cross-SDK transplant has no stale oat/ if transplanted
+    lib_subs = ("lib64",) if only_64bit else ("lib64", "lib")
+    copied_nfc_libs = 0
+    for _, b_root, f_root in part_pairs:
+        for lsub in lib_subs:
+            b_ld = b_root / lsub
+            f_ld = f_root / lsub
+            if not b_ld.is_dir():
+                continue
+            for nq_so in list(b_ld.glob("*nqnfc*.so")) + list(b_ld.glob("libnfc_nci_jni*.so")):
+                if nq_so.is_file() and not (f_ld / nq_so.name).exists():
+                    f_ld.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(nq_so, f_ld / nq_so.name, follow_symlinks=False)
+                    copied_nfc_libs += 1
+        # Copy libnfc-*.conf and NXP/NFC permission XMLs if missing
+        b_etc = b_root / "etc"
+        f_etc = f_root / "etc"
+        if b_etc.is_dir():
+            for cfg in b_etc.glob("libnfc*.conf"):
+                if cfg.is_file() and not (f_etc / cfg.name).exists():
+                    f_etc.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(cfg, f_etc / cfg.name)
+            b_perm = b_etc / "permissions"
+            f_perm = f_etc / "permissions"
+            if b_perm.is_dir():
+                for xml in list(b_perm.glob("*nfc*.xml")) + list(b_perm.glob("*nxp*.xml")):
+                    if "st21" in xml.name.lower() or "stnfc" in xml.name.lower():
+                        continue
+                    if xml.is_file() and not (f_perm / xml.name).exists():
+                        f_perm.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(xml, f_perm / xml.name)
+    if copied_nfc_libs:
+        print(f"  [NFC-NXP] تم نقل {copied_nfc_libs} مكتبة NXP NFC أصلية (libnqnfc*) لشريحة joyeuse", flush=True)
+
+
+def fix_sm6250_ril_and_region(base_dir: Path, final_dir: Path):
+    """Enforce HIDL RIL/OEMHook fallback (ro.board.api_level=29), remove crashing uceShimService/NtnSatApp, and align init.region.sh."""
+    vendor_dir = final_dir / "vendor"
+    vendor_bp = vendor_dir / "build.prop"
+    if vendor_bp.is_file():
+        # Preserve ro.board.api_level=29 & ro.product.first_api_level=29 so Android 16 QtiTelephony.apk
+        # (QtiRadioFactory) & qcrilmsgtunnel.apk (QcrilOemhookMsgTunnel) use HIDL qtiradio@1.0..2.4 & qcrilhook@1.0
+        cur_board_api = ""
+        for ln in vendor_bp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ln.startswith("ro.board.api_level="):
+                cur_board_api = ln.split("=", 1)[1].strip()
+                break
+        try:
+            api_int = int(cur_board_api) if cur_board_api else 29
+        except ValueError:
+            api_int = 29
+        if api_int > 30 or not cur_board_api:
+            set_or_update_props(vendor_bp, {"ro.board.api_level": "29", "ro.product.first_api_level": "29"})
+            print("  [RIL-HIDL] تم تثبيت ro.board.api_level=29 في vendor/build.prop لتفعيل وضع HIDL التلقائي في QtiTelephony و qcrilmsgtunnel", flush=True)
+        else:
+            print(f"  [RIL-HIDL] تم التحقق من ro.board.api_level={api_int} (<=30) لتشغيل شبكة الاتصال عبر HIDL على SM6250", flush=True)
+
+    # Ensure upper partitions never override ro.board.api_level with Port SoC's level (34/35/36)
+    for upper_bp in (
+        final_dir / "system" / "system" / "build.prop",
+        final_dir / "system" / "build.prop",
+        final_dir / "system_ext" / "etc" / "build.prop",
+        final_dir / "product" / "etc" / "build.prop",
+        final_dir / "mi_ext" / "etc" / "build.prop",
+    ):
+        if upper_bp.is_file():
+            lines = upper_bp.read_text(encoding="utf-8", errors="ignore").splitlines()
+            filtered = [ln for ln in lines if not ln.strip().startswith("ro.board.api_level=")]
+            if len(filtered) != len(lines):
+                upper_bp.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+
+    # Always remove uceShimService & NtnSatApp (crash on SM6250 non-AIDL/non-satellite modem regardless of debloat flag)
+    for crash_app in ("uceShimService", "NtnSatApp"):
+        for sub in ("app", "priv-app"):
+            cand = final_dir / "system_ext" / sub / crash_app
+            if cand.exists():
+                shutil.rmtree(cand, ignore_errors=True) if cand.is_dir() else cand.unlink(missing_ok=True)
+                print(f"  [RIL-FIX] تم حذف الخدمة المتعارضة مع مودم SM6250: system_ext/{sub}/{crash_app}", flush=True)
+
+    # Align vendor/bin/init.region.sh (_eea_global -> _global) when Port ROM is a Global (MIXM / _global) build
+    region_sh = vendor_dir / "bin" / "init.region.sh"
+    if region_sh.is_file():
+        port_is_global = False
+        port_is_eea = False
+        for bp in (
+            final_dir / "mi_ext" / "etc" / "build.prop",
+            final_dir / "product" / "etc" / "build.prop",
+            final_dir / "system" / "system" / "build.prop",
+        ):
+            if not bp.is_file():
+                continue
+            txt = bp.read_text(encoding="utf-8", errors="ignore")
+            if "EUXM" in txt or "_eea_global" in txt:
+                port_is_eea = True
+            elif "MIXM" in txt or "_global" in txt:
+                port_is_global = True
+        if port_is_global and not port_is_eea:
+            sh_txt = region_sh.read_text(encoding="utf-8", errors="ignore")
+            if "_eea_global" in sh_txt:
+                region_sh.write_text(sh_txt.replace("_eea_global", "_global"), encoding="utf-8")
+                region_sh.chmod(0o755)
+                print("  [REGION-FIX] تم تحديث vendor/bin/init.region.sh من _eea_global إلى _global لمطابقة روم MIXM العالمي", flush=True)
+
+
 def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
     """Transplant proven SM6250/miatoll fixes from Base ROM:
        1. USB ConfigFS init scripts when vendor.usb.use_gadget_hal=0 (fixes USB MTP & ADB)
-       2. Linux 4.14 cgroup v1 + uclamp task_profiles.json (fixes Android 15 Cached App Freezer)
+       2. Linux 4.14 cgroup v1 + uclamp task_profiles.json (fixes Android 15/16 Cached App Freezer)
        3. Qualcomm OMX libstagefright*.so when Base & Port share identical Android SDK version (fixes HW video)
+       4. Camera MiaFrame v10 JNI libs (verified via ELF UND symbol resolution across SDKs) + camera permissions XML
+       5. Sysconfig xd_port_fixes.xml + Pangu merge + joyeuse NXP NFC transplant & ST NFC purge
     """
     final_sys = (final_dir / "system" / "system") if (final_dir / "system" / "system" / "build.prop").is_file() else (final_dir / "system")
     base_sys = (base_dir / "system" / "system") if (base_dir / "system" / "system" / "build.prop").is_file() else (base_dir / "system")
     if not base_sys.is_dir() or not final_sys.is_dir():
         return
 
+    only_64 = is_64bit_only_system(final_sys)
+    lib_subs = ("lib64",) if only_64 else ("lib", "lib64")
     vendor_bp = (final_dir / "vendor" / "build.prop").read_text(encoding="utf-8", errors="ignore") if (final_dir / "vendor" / "build.prop").is_file() else ""
 
     # 1. USB ConfigFS init scripts for SM6250 (use_gadget_hal=0)
@@ -323,18 +846,10 @@ def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
         print("  [CGROUP-FIX] تم نقل task_profiles.json المتوافق مع نواة 4.14 (uclamp + cgroup v1 freezer)", flush=True)
 
     # 3. Qualcomm OMX libstagefright*.so video playback/encoding fix (only when SDK matches, e.g. 35 == 35)
-    def get_sdk(sys_root: Path) -> str:
-        bp = sys_root / "build.prop"
-        if bp.is_file():
-            for ln in bp.read_text(encoding="utf-8", errors="ignore").splitlines():
-                if ln.startswith("ro.build.version.sdk="):
-                    return ln.split("=", 1)[1].strip()
-        return ""
-
-    b_sdk, f_sdk = get_sdk(base_sys), get_sdk(final_sys)
+    b_sdk, f_sdk = str(get_partition_sdk(base_sys) or ""), str(get_partition_sdk(final_sys) or "")
     if b_sdk and b_sdk == f_sdk:
         copied_sf = 0
-        for lib_sub in ("lib", "lib64"):
+        for lib_sub in lib_subs:
             b_ldir = base_sys / lib_sub
             f_ldir = final_sys / lib_sub
             if not b_ldir.is_dir() or not f_ldir.is_dir():
@@ -346,33 +861,53 @@ def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
         if copied_sf:
             print(f"  [VIDEO-FIX] تم زرع {copied_sf} مكتبة libstagefright متوافقة مع OMX لمعالج SM6250 (SDK {f_sdk})", flush=True)
 
-        # 4. Camera MiaFrame v10 algoup/mianode JNI fix from MiatollCave 2026-11-06
-        copied_cam_jni = 0
-        for lib_sub in ("lib", "lib64"):
-            for cam_so in ("libcamera_algoup_jni.xiaomi.so", "libcamera_mianode_jni.xiaomi.so"):
-                src_so = base_dir / "system_ext" / lib_sub / cam_so
-                dst_so = final_dir / "system_ext" / lib_sub / cam_so
-                if src_so.is_file() and dst_so.parent.is_dir():
-                    shutil.copy2(src_so, dst_so)
-                    copied_cam_jni += 1
-        if copied_cam_jni:
-            print(f"  [CAMERA-FIX] تم زرع {copied_cam_jni} مكتبة algoup/mianode JNI متوافقة مع MiaFrame v10 لكاميرا miatoll", flush=True)
+    # 4. Camera MiaFrame v10 algoup/mianode JNI fix (with strict ELF UND symbol verification when crossing SDKs!)
+    avail_64_sonames, exported_64_syms = collect_exported_elf_symbols(final_dir, is_64=True)
+    copied_cam_jni = 0
+    for lib_sub in lib_subs:
+        for cam_so in ("libcamera_algoup_jni.xiaomi.so", "libcamera_mianode_jni.xiaomi.so"):
+            src_so = base_dir / "system_ext" / lib_sub / cam_so
+            dst_so = final_dir / "system_ext" / lib_sub / cam_so
+            if not src_so.is_file() or not dst_so.parent.is_dir():
+                continue
+            if b_sdk != f_sdk and lib_sub == "lib64":
+                ok_elf, missing_syms = elf_und_symbols_resolvable(src_so, avail_64_sonames, exported_64_syms)
+                if not ok_elf:
+                    print(f"  [CAMERA-SAFE] الإبقاء على {cam_so} الأصلي لـ SDK {f_sdk} بسبب اختلاف رموز C++: {missing_syms[:5]}", flush=True)
+                    continue
+            shutil.copy2(src_so, dst_so)
+            copied_cam_jni += 1
+    if copied_cam_jni:
+        print(f"  [CAMERA-FIX] تم زرع {copied_cam_jni} مكتبة algoup/mianode JNI متوافقة مع MiaFrame v10 بعد فحص روابط ELF (SDK {f_sdk})", flush=True)
+
+    # Copy MiuiCamera privapp-permissions XMLs (e.g. privapp-permissions-xd-miuicamera.xml) from Base if missing
+    b_pperm = base_dir / "product" / "etc" / "permissions"
+    f_pperm = final_dir / "product" / "etc" / "permissions"
+    if b_pperm.is_dir() and f_pperm.is_dir():
+        for cam_xml in b_pperm.glob("*miuicamera*.xml"):
+            if cam_xml.is_file() and not (f_pperm / cam_xml.name).exists():
+                shutil.copy2(cam_xml, f_pperm / cam_xml.name)
+                print(f"  [CAMERA-PERM] تم نقل صلاحيات الكاميرا {cam_xml.name} إلى product/etc/permissions", flush=True)
 
     # 5. Disable crashing CollectRunningTasksService on boot (xd_port_fixes.xml)
     syscfg_dir = final_dir / "system_ext" / "etc" / "sysconfig"
     if syscfg_dir.is_dir():
-        (syscfg_dir / "xd_port_fixes.xml").write_text(
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<config>\n'
-            '    <component-override package="com.xiaomi.xmsf">\n'
-            '        <component class="com.xiaomi.xmsf.eventtracking.CollectRunningTasksService" enabled="false" />\n'
-            '    </component-override>\n'
-            '</config>\n',
-            encoding="utf-8",
-        )
+        b_xd = base_dir / "system_ext" / "etc" / "sysconfig" / "xd_port_fixes.xml"
+        if b_xd.is_file() and "CollectRunningTasksService" in b_xd.read_text(encoding="utf-8", errors="ignore"):
+            shutil.copy2(b_xd, syscfg_dir / "xd_port_fixes.xml")
+        else:
+            (syscfg_dir / "xd_port_fixes.xml").write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<config>\n'
+                '    <component-override package="com.xiaomi.xmsf">\n'
+                '        <component class="com.xiaomi.xmsf.eventtracking.CollectRunningTasksService" enabled="false" />\n'
+                '    </component-override>\n'
+                '</config>\n',
+                encoding="utf-8",
+            )
         print("  [BOOT-FIX] تم حقن xd_port_fixes.xml لمنع انهيار CollectRunningTasksService عند الإقلاع", flush=True)
 
-    # 6. Merge product/pangu/system -> product for NFC (NQNfcNci) if pangu split exists
+    # 6. Merge product/pangu/system -> product if pangu split exists, then purge ST NFC & transplant joyeuse NXP NFC
     pangu_sys = final_dir / "product" / "pangu" / "system"
     if pangu_sys.is_dir():
         for sub in pangu_sys.iterdir():
@@ -382,7 +917,11 @@ def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
             else:
                 shutil.copy2(sub, dest_sub, follow_symlinks=False)
         shutil.rmtree(final_dir / "product" / "pangu", ignore_errors=True)
-        print("  [NFC-FIX] تم دمج product/pangu/system داخل product لتفعيل NFC وتقليل التكرار", flush=True)
+        print("  [PANGU-MERGE] تم دمج product/pangu/system داخل product لتقليل التكرار", flush=True)
+
+    fix_joyeuse_nxp_nfc(base_dir, final_dir, only_64bit=only_64)
+    fix_sm6250_ril_and_region(base_dir, final_dir)
+    patch_android16_netbpfload_for_414(final_dir)
 
 
 def transplant_vndk_and_selinux_mappings(base_dir: Path, final_dir: Path):
@@ -609,6 +1148,8 @@ def reconcile_selinux_configs(part_dir: Path, config_dir: Path, part_name: str):
                     inherited_ctx = "u:object_r:vendor_configs_file:s0" if part_name == "vendor" else "u:object_r:system_file:s0"
                 elif "/etc/selinux/" in fc_key and fc_key.endswith(".cil"):
                     inherited_ctx = "u:object_r:sepolicy_file:s0"
+                elif fc_key.endswith("/netbpfload_414"):
+                    inherited_ctx = "u:object_r:bpfloader_exec:s0"
                 new_fc_lines.append(f"/{re.escape(part_name)}/{re.escape(rel)} {inherited_ctx}")
                 known_fc_map[fc_key] = inherited_ctx
 

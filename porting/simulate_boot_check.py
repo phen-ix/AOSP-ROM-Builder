@@ -187,6 +187,24 @@ def check_stage1_boot_and_fstab(workdir: Path) -> tuple[bool, str]:
     if not (has_erofs and has_uclamp):
         return False, f"الكيرنل يفتقد دعم EROFS ({has_erofs}) أو uclamp ({has_uclamp})!"
 
+    # When porting Android 16+ (SDK >= 36), verify mandatory 4.14 syscall & BPF JIT backports in kernel image
+    sys_root = resolve_sys_root(workdir / "final")
+    sdk_str = read_prop([sys_root / "build.prop"], "ro.build.version.sdk")
+    sdk_ver = int(sdk_str) if sdk_str.isdigit() else 0
+    a16_note = ""
+    if sdk_ver >= 36:
+        required_ksyms = (
+            b"close_range",
+            b"faccessat2",
+            b"epoll_pwait2",
+            b"process_mrelease",
+            b"bpf_jit_enable",
+        )
+        missing_ksyms = [s.decode() for s in required_ksyms if s not in k_raw]
+        if missing_ksyms:
+            return False, f"كيرنل 4.14 يفتقد استدعاءات النظام الإلزامية لـ Android 16 (SDK {sdk_ver}): {missing_ksyms}"
+        a16_note = f"، وتم التحقق من وجود استدعاءات Android 16 (`close_range`, `faccessat2`, `epoll_pwait2`, `process_mrelease`, `bpf_jit_enable`)"
+
     # 2. Check Ramdisk fstab & /init
     r_off = page_sz + align(kernel_sz)
     r_bytes = data[r_off : r_off + ramdisk_sz]
@@ -216,7 +234,7 @@ def check_stage1_boot_and_fstab(workdir: Path) -> tuple[bool, str]:
                 return False, "توقيع شجرة العتاد DTB داخل boot.img غير صالح!"
 
     return True, (
-        f"نواة ARM64 صالحة ({len(k_raw)//1024//1024} MB مفكوكة، تحتوي رموز `erofs` + `uclamp`)، "
+        f"نواة ARM64 صالحة ({len(k_raw)//1024//1024} MB مفكوكة، تحتوي رموز `erofs` + `uclamp`{a16_note})، "
         f"وملفات `{', '.join(fstab_names)}` في الـ Ramdisk تغطي كل الأقسام {logical_parts}"
     )
 
@@ -281,8 +299,9 @@ def check_stage3_vndk_and_linker(final_dir: Path) -> tuple[bool, str]:
                         subprocess.run(["extract.erofs", "-i", str(payload_img), "-o", str(out_ex), "-x"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         for so in out_ex.rglob("*.so"):
                             avail_libs.add(so.name)
-                    elif shutil.which("debugfs"):
-                        res = subprocess.run(["debugfs", "-R", "ls -p /lib64", str(payload_img)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    elif shutil.which("debugfs") or Path("/usr/sbin/debugfs").is_file():
+                        debugfs_bin = shutil.which("debugfs") or "/usr/sbin/debugfs"
+                        res = subprocess.run([debugfs_bin, "-R", "ls -p /lib64", str(payload_img)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
                         for tok in (res.stdout or "").splitlines():
                             parts = tok.split("/")
                             if len(parts) >= 6 and parts[5].endswith(".so"):
@@ -294,22 +313,43 @@ def check_stage3_vndk_and_linker(final_dir: Path) -> tuple[bool, str]:
     #Also include core Bionic APEX libs provided by com.android.runtime / i18n / art
     avail_libs.update({"libc.so", "libm.so", "libdl.so", "libdl_android.so", "ld-android.so", "libclang_rt.ubsan_standalone-aarch64-android.so"})
 
-    # Inspect critical vendor HAL binaries via readelf -d
+    # Inspect critical vendor HAL binaries via readelf -d AND verify 32/64-bit PT_INTERP compatibility
     readelf = shutil.which("readelf")
     checked_hals = 0
     missing_map: dict[str, list[str]] = {}
+    bad_interp_32: list[str] = []
     hw_bin_dir = vendor_dir / "bin" / "hw"
-    critical_keywords = ("composer", "allocator", "keymaster", "gatekeeper", "sensors", "audio.service", "biometrics.fingerprint")
+    abilist32 = read_prop([sys_root / "build.prop"], "ro.system.product.cpu.abilist32")
+    has_32bit_userspace = bool(abilist32) and os.path.lexists(sys_root / "bin" / "linker")
+
+    if not os.path.lexists(sys_root / "bin" / "linker64") and not os.path.lexists(sys_root / "bin" / "bootstrap" / "linker64"):
+        return False, "المفسر الديناميكي 64-بت `/system/bin/linker64` مفقود من النظام!"
+
+    critical_keywords = ("composer", "allocator", "keymaster", "gatekeeper", "sensors", "audio.service", "biometrics.fingerprint", "qcrild")
     if readelf and hw_bin_dir.is_dir():
         for bin_path in sorted(hw_bin_dir.iterdir()):
-            if not bin_path.is_file() or not any(k in bin_path.name for k in critical_keywords):
+            if not bin_path.is_file() or bin_path.is_symlink():
+                continue
+            # Check PT_INTERP on ALL vendor/bin/hw executables when system is 64-bit-only
+            if not has_32bit_userspace:
+                l_res = subprocess.run([readelf, "-l", "-W", str(bin_path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                m_int = re.search(r"Requesting program interpreter:\s*([^\]]+)\]", l_res.stdout or "")
+                if m_int:
+                    interp_path = m_int.group(1).strip()
+                    if interp_path.endswith("/linker") or interp_path.endswith("/linker_asan"):
+                        if any(k in bin_path.name for k in critical_keywords):
+                            bad_interp_32.append(f"{bin_path.name}({interp_path})")
+            if not any(k in bin_path.name for k in critical_keywords):
                 continue
             checked_hals += 1
-            res = subprocess.run([readelf, "-d", str(bin_path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            res = subprocess.run([readelf, "-d", "-W", str(bin_path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             needed = re.findall(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]", res.stdout or "")
             missing = [lib for lib in needed if lib not in avail_libs]
             if missing:
                 missing_map[bin_path.name] = missing
+
+    if bad_interp_32:
+        return False, f"خدمات HAL حرجة 32-بت بدون مفسر `/system/bin/linker` في روم 64-bit-only: {bad_interp_32}"
 
     if missing_map:
         # Filter if any missing lib exists deeper in vendor/system
@@ -322,7 +362,77 @@ def check_stage3_vndk_and_linker(final_dir: Path) -> tuple[bool, str]:
         if still_missing:
             return False, f"نقص مكتبات ديناميكية لخدمات العتاد الحرجة: {still_missing}"
 
-    return True, f"حزمة `{found_vndk.name}` متوفرة لـ `ro.vndk.version={vndk_ver}`، وتم التحقق من روابط `{checked_hals}` خدمات HAL أساسية بنجاح"
+    abi_mode = "64-bit-only" if not has_32bit_userspace else "64+32-bit"
+    return True, f"حزمة `{found_vndk.name}` متوفرة لـ `ro.vndk.version={vndk_ver}`، وتم التحقق من روابط `{checked_hals}` خدمات HAL ومطابقة `PT_INTERP` ({abi_mode}) بنجاح"
+
+
+def verify_android16_port_invariants(final_dir: Path, sys_root: Path) -> tuple[bool, str]:
+    """Verify Android 16 (SDK 36+) netbpfload_414 dual-gate patch, RIL HIDL api_level<=30, and joyeuse NXP NFC hygiene."""
+    sdk_str = read_prop([sys_root / "build.prop"], "ro.build.version.sdk")
+    sdk_ver = int(sdk_str) if sdk_str.isdigit() else 0
+    checks_done: list[str] = []
+
+    if sdk_ver >= 36:
+        # 1. netbpfload_414 binary + dual NOP gates + SELinux context + mounton CIL + init.rc bind-mount
+        nb_bin = sys_root / "bin" / "netbpfload_414"
+        if not nb_bin.is_file():
+            return False, "ملف `/system/bin/netbpfload_414` مفقود في بورت Android 16 (سيؤدي لإعادة تشغيل فورية في `bpfloader`)!"
+        nb_bytes = nb_bin.read_bytes()
+        if nb_bytes[:4] != b"\x7fELF" or nb_bytes[4] != 2 or struct.unpack_from("<H", nb_bytes, 18)[0] != 183:
+            return False, "ملف `netbpfload_414` ليس ثنائي ELF64 AArch64 صالحاً!"
+        if len(nb_bytes) > 0xdd18 and (
+            nb_bytes[0xdcf0:0xdcf4] == b"\x69\x17\x00\x54" or nb_bytes[0xdd14:0xdd18] == b"\xe0\x16\x00\x36"
+        ):
+            return False, "إحدى بوابتي فحص الكيرنل (`4.19` عند `0xdcf0` أو `5.4` عند `0xdd14`) لم تُرقّع إلى NOP داخل `netbpfload_414`!"
+        if nb_bytes.count(b"\x1f\x20\x03\xd5") < 2:
+            return False, "ملف `netbpfload_414` لا يحتوي تعليمتي NOP اللازمتين لتجاوز فحصي 4.19 و 5.4!"
+
+        fc_cfg = final_dir / "config" / "system_file_contexts"
+        if fc_cfg.is_file():
+            fc_txt = fc_cfg.read_text(encoding="utf-8", errors="ignore")
+            if "netbpfload_414" not in fc_txt or "u:object_r:bpfloader_exec:s0" not in fc_txt:
+                return False, "سياق SELinux `u:object_r:bpfloader_exec:s0` غير مسجل لـ `netbpfload_414` في `system_file_contexts`!"
+
+        plat_cil = sys_root / "etc" / "selinux" / "plat_sepolicy.cil"
+        if not plat_cil.is_file() or "(allow init bpfloader_exec (file (mounton)))" not in plat_cil.read_text(encoding="utf-8", errors="ignore"):
+            return False, "قاعدة `(allow init bpfloader_exec (file (mounton)))` مفقودة من `plat_sepolicy.cil`!"
+
+        init_rc = sys_root / "etc" / "init" / "hw" / "init.rc"
+        if not init_rc.is_file() or "mount none /system/bin/netbpfload_414 /apex/com.android.tethering/bin/netbpfload bind" not in init_rc.read_text(encoding="utf-8", errors="ignore"):
+            return False, "أمر الربط `mount none /system/bin/netbpfload_414 ... bind` مفقود من `init.rc`!"
+
+        nb_rc = sys_root / "etc" / "init" / "netbpfload.rc"
+        if nb_rc.is_file():
+            first_ln = nb_rc.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+            if not first_ln.startswith("#"):
+                return False, "تم العبث بالترويسة الوصفية للسطر الأول من `netbpfload.rc`!"
+        checks_done.append("netbpfload_414(dual-NOP + mounton)")
+
+    # 2. RIL HIDL safeguard: ro.board.api_level <= 30 on vendor & no uceShimService / NtnSatApp
+    vendor_bp = final_dir / "vendor" / "build.prop"
+    board_api = read_prop([vendor_bp], "ro.board.api_level")
+    if board_api and board_api.isdigit() and int(board_api) > 30:
+        return False, f"قيمة `ro.board.api_level={board_api}` (>30) في `vendor/build.prop` ستعطل شبكة HIDL RIL على SM6250!"
+    for bad_ril_app in ("uceShimService", "NtnSatApp"):
+        if (final_dir / "system_ext" / "app" / bad_ril_app).exists():
+            return False, f"التطبيق المتعارض مع المودم `system_ext/app/{bad_ril_app}` لم يُحذف!"
+    checks_done.append(f"HIDL-RIL(api={board_api or '29'})")
+
+    # 3. NFC hygiene: zero STMicroelectronics NFC apps & no stale oat/ inside NQNfcNci
+    for root_d in (sys_root, final_dir / "system_ext", final_dir / "product"):
+        for sub in ("app", "priv-app"):
+            d = root_d / sub
+            if not d.is_dir():
+                continue
+            for entry in d.iterdir():
+                low = entry.name.lower()
+                if any(p in low for p in ("nfc_st", "nfcst", "stnfcextension")):
+                    return False, f"لا تزال حزمة ST NFC المتعارضة موجودة: `{entry}`!"
+                if "nqnfcnci" in low and entry.is_dir() and sdk_ver >= 36 and (entry / "oat").exists():
+                    return False, f"لا يزال مجلد `oat/` القديم موجوداً داخل `{entry.name}` مما قد يسبب تعارض ART!"
+    checks_done.append("NXP-NFC-clean")
+
+    return True, ", ".join(checks_done)
 
 
 def check_stage4_qemu_arm64(final_dir: Path) -> tuple[bool, str]:
@@ -335,8 +445,12 @@ def check_stage4_qemu_arm64(final_dir: Path) -> tuple[bool, str]:
     if hdr[:4] != b"\x7fELF" or hdr[4] != 2 or struct.unpack_from("<H", hdr, 18)[0] != 183:
         return False, "ملف /system/bin/init ليس ملف ELF 64-bit ARM64 صالحاً!"
 
+    ok_inv, inv_msg = verify_android16_port_invariants(final_dir, sys_root)
+    if not ok_inv:
+        return False, inv_msg
+
     if not qemu:
-        return True, "تم التحقق من سلامة ترويسات ELF AArch64 لـ `/system/bin/init`"
+        return True, f"تم التحقق من سلامة ثنائيات ELF AArch64 وضوابط البورت ({inv_msg})"
 
     # Locate runtime libc.so/libm.so/libdl.so inside bootstrap-apex or lib64/bootstrap
     bootstrap_lib = sys_root / "lib64" / "bootstrap"
@@ -350,9 +464,9 @@ def check_stage4_qemu_arm64(final_dir: Path) -> tuple[bool, str]:
             env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15
         )
         if res.returncode == 0 and "aarch64" in (res.stdout or ""):
-            return True, f"نجح تشغيل `linker64` + `libc.so` + `toybox` الخاص بالروم فعلياً داخل محاكي `qemu-aarch64-static` (`{res.stdout.strip()}`)"
+            return True, f"نجح تشغيل `linker64` + `libc.so` + `toybox` فعلياً داخل `qemu-aarch64-static` (`{res.stdout.strip()}`) | الضوابط: `{inv_msg}`"
 
-    return True, "تم التحقق من صلاحية ثنائيات ARM64 (`/system/bin/init` + `linker64`)"
+    return True, f"تم التحقق من صلاحية ثنائيات ARM64 (`/system/bin/init` + `linker64`) | الضوابط: `{inv_msg}`"
 
 
 def check_stage5_avb_vbmeta(workdir: Path) -> tuple[bool, str]:
