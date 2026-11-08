@@ -9,9 +9,9 @@ on:
         default: "HyperOS-3.0-A16-KunziteGlobal"
         type: string
       base_rom_url:
-        description: "رابط الروم الأساسي لهاتف miatoll/joyeuse (افتراضياً: MiatollCave 64-bit-only المحدث)"
+        description: "رابط الروم الأساسي لهاتف miatoll/joyeuse (افتراضياً: MiatollCave 2026-11-07 64-bit-only المحدث)"
         required: true
-        default: "https://pixeldrain.com/api/file/TS1cn1RH"
+        default: "https://pixeldrain.com/api/file/Ya9uKFfV"
         type: string
       port_rom_url:
         description: "رابط روم الواجهة الكاملة المراد سحب النظام منها (افتراضياً: kunzite Global OS3.0.304.0.WPQMIXM Android 16)"
