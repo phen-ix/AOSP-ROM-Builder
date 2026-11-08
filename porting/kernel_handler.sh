@@ -152,6 +152,9 @@ elif [ "$KERNEL_MODE" = "compile_phenix_new" ]; then
       mv -f "${OUT_FW}/dtbo.img.new" "${OUT_FW}/dtbo.img" && \
       echo "  [DTBO] تم توليد dtbo.img المخصص لـ joyeuse/miatoll بنجاح" || true
   fi
+  if [ -f "out/System.map" ]; then
+    cp -f "out/System.map" "${WORKDIR}/kernel_System.map"
+  fi
   popd >/dev/null
   rm -rf "$K_SRC" "$CLANG_DIR"
 

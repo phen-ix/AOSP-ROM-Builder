@@ -942,6 +942,244 @@ def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
     fix_joyeuse_nxp_nfc(base_dir, final_dir, only_64bit=only_64)
     fix_sm6250_ril_and_region(base_dir, final_dir)
     patch_android16_netbpfload_for_414(final_dir)
+    if only_64:
+        transplant_32bit_vendor_hal_bridge(base_dir, final_dir)
+
+
+def transplant_32bit_vendor_hal_bridge(base_dir: Path, final_dir: Path):
+    """Bridge 32-bit vendor HALs (audio.service, media.omx, cas@1.2) onto a 64-bit-only Port system
+    without modifying any signed APEX or enabling 32-bit Zygote/ART."""
+    vendor_dir = final_dir / "vendor"
+    elf32_hals: list[str] = []
+    for vsub in ("bin/hw", "bin"):
+        vd = vendor_dir / vsub
+        if not vd.is_dir():
+            continue
+        for item in sorted(vd.iterdir()):
+            if item.is_file() and not item.is_symlink():
+                try:
+                    with open(item, "rb") as f:
+                        hdr = f.read(6)
+                    if hdr[:5] == b"\x7fELF\x01":
+                        elf32_hals.append(f"{vsub}/{item.name}")
+                except OSError:
+                    pass
+    if not elf32_hals:
+        return
+
+    base_sys = (base_dir / "system" / "system") if (base_dir / "system" / "system" / "build.prop").is_file() else (base_dir / "system")
+    final_sys = (final_dir / "system" / "system") if (final_dir / "system" / "system" / "build.prop").is_file() else (final_dir / "system")
+    if not base_sys.is_dir():
+        return
+
+    print(
+        f"=== [32BIT-HAL-BRIDGE] اكتشاف {len(elf32_hals)} خدمة عتاد 32-بت في vendor (منها Audio/OMX) على نظام 64-bit-only ===",
+        flush=True,
+    )
+
+    # 1. Extract 32-bit runtime linker from Base com.android.runtime.apex and redirect config -> /system/etc/ld.config.arm
+    rt_apex = None
+    if (base_sys / "apex").is_dir():
+        for cand in sorted((base_sys / "apex").iterdir()):
+            if "com.android.runtime" in cand.name.lower() or "com.google.android.runtime" in cand.name.lower():
+                rt_apex = cand
+                break
+    if not rt_apex:
+        raise RuntimeError("تعذر العثور على com.android.runtime.apex في الروم الأساسي لاستخراج مفسر 32-بت!")
+
+    old_cfg_bytes = b"/linkerconfig/ld.config.txt\x00"
+    new_cfg_bytes = b"/system/etc/ld.config.arm\x00\x00\x00"
+    assert len(old_cfg_bytes) == len(new_cfg_bytes) == 28
+
+    for l_name in ("linker", "linker_asan"):
+        raw_lnk = extract_file_from_apex(rt_apex, f"bin/{l_name}")
+        if not raw_lnk:
+            if l_name == "linker":
+                raise RuntimeError(f"تعذر استخراج bin/{l_name} من {rt_apex.name}!")
+            continue
+        if old_cfg_bytes not in raw_lnk:
+            if l_name == "linker":
+                raise RuntimeError("تعذر العثور على مسار /linkerconfig/ld.config.txt داخل مفسر 32-بت!")
+            continue
+        patched_lnk = raw_lnk.replace(old_cfg_bytes, new_cfg_bytes, 1)
+        dst_lnk = final_sys / "bin" / l_name
+        if os.path.lexists(dst_lnk):
+            dst_lnk.unlink()
+        dst_lnk.write_bytes(patched_lnk)
+        dst_lnk.chmod(0o755)
+
+    cd32 = extract_file_from_apex(rt_apex, "bin/crash_dump32")
+    if cd32:
+        dst_cd = final_sys / "bin" / "crash_dump32"
+        if not os.path.lexists(dst_cd):
+            dst_cd.write_bytes(cd32)
+            dst_cd.chmod(0o755)
+
+    # Copy bootstrap 32-bit linker binaries for early-init (e.g., boringssl_self_test32)
+    b_boot_bin = base_sys / "bin" / "bootstrap"
+    f_boot_bin = final_sys / "bin" / "bootstrap"
+    if b_boot_bin.is_dir():
+        f_boot_bin.mkdir(parents=True, exist_ok=True)
+        for bl in ("linker", "linker_asan"):
+            if (b_boot_bin / bl).is_file() and not os.path.lexists(f_boot_bin / bl):
+                shutil.copy2(b_boot_bin / bl, f_boot_bin / bl, follow_symlinks=False)
+                (f_boot_bin / bl).chmod(0o755)
+
+    # 2. Transplant 32-bit Bionic bootstrap + LLNDK/system libs (/system/lib & /system_ext/lib)
+    copied_32 = 0
+    if (base_sys / "lib").is_dir():
+        shutil.copytree(base_sys / "lib", final_sys / "lib", symlinks=True, dirs_exist_ok=True)
+        copied_32 += sum(1 for _ in (final_sys / "lib").rglob("*.so"))
+    if (base_dir / "system_ext" / "lib").is_dir():
+        shutil.copytree(base_dir / "system_ext" / "lib", final_dir / "system_ext" / "lib", symlinks=True, dirs_exist_ok=True)
+
+    # Extract 32-bit ICU core .so from Base com.android.i18n.apex for transitive VNDK dependencies (e.g. libxml2.so)
+    if (base_sys / "apex").is_dir():
+        for cand in sorted((base_sys / "apex").iterdir()):
+            if "i18n" in cand.name.lower():
+                for icu_so in ("libandroidicu.so", "libicu.so", "libicui18n.so", "libicuuc.so"):
+                    dst_icu = final_sys / "lib" / icu_so
+                    if not dst_icu.exists():
+                        raw_icu = extract_file_from_apex(cand, f"lib/{icu_so}")
+                        if raw_icu:
+                            dst_icu.parent.mkdir(parents=True, exist_ok=True)
+                            dst_icu.write_bytes(raw_icu)
+                            copied_32 += 1
+                break
+
+    # 3. Generate isolated 32-bit vendor HAL linker configuration (/system/etc/ld.config.arm)
+    vndk_ver = "30"
+    v_bp = vendor_dir / "build.prop"
+    if v_bp.is_file():
+        for ln in v_bp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ln.strip().startswith("ro.vndk.version="):
+                val = ln.split("=", 1)[1].strip()
+                if val:
+                    vndk_ver = val
+                    break
+
+    vndk_lib = f"/apex/com.android.vndk.v{vndk_ver}/lib"
+    vndk_root = f"/apex/com.android.vndk.v{vndk_ver}"
+    ld_cfg_arm = f"""# Isolated 32-bit Native Vendor HAL Linker Config (64-bit-only Android 15/16 Port)
+dir.vendor = /vendor/
+dir.odm = /odm/
+dir.system = /system/
+
+[vendor]
+additional.namespaces = sphal,vndk,system
+
+namespace.default.isolated = false
+namespace.default.visible = true
+namespace.default.search.paths = /vendor/lib:/vendor/lib/vndk:/vendor/lib/vndk-sp:/vendor/lib/hw:/vendor/lib/egl:/odm/lib:{vndk_lib}:/system/lib/bootstrap:/system/lib:/system_ext/lib
+namespace.default.permitted.paths = /vendor:/odm:{vndk_root}:/system/lib:/system_ext/lib
+namespace.default.links = sphal,vndk,system
+namespace.default.link.sphal.allow_all_shared_libs = true
+namespace.default.link.vndk.allow_all_shared_libs = true
+namespace.default.link.system.allow_all_shared_libs = true
+
+namespace.sphal.isolated = false
+namespace.sphal.visible = true
+namespace.sphal.search.paths = /odm/lib:/vendor/lib:/vendor/lib/egl:/vendor/lib/hw:/vendor/lib/vndk:/vendor/lib/vndk-sp:{vndk_lib}:/system/lib/bootstrap:/system/lib
+namespace.sphal.permitted.paths = /odm:/vendor:{vndk_root}:/system/lib
+namespace.sphal.links = default,vndk,system
+namespace.sphal.link.default.allow_all_shared_libs = true
+namespace.sphal.link.vndk.allow_all_shared_libs = true
+namespace.sphal.link.system.allow_all_shared_libs = true
+
+namespace.vndk.isolated = false
+namespace.vndk.visible = true
+namespace.vndk.search.paths = {vndk_lib}:/vendor/lib/vndk:/vendor/lib/vndk-sp:/vendor/lib:/system/lib/bootstrap:/system/lib:/system_ext/lib
+namespace.vndk.permitted.paths = {vndk_root}:/vendor:/odm:/system/lib:/system_ext/lib
+namespace.vndk.links = default,sphal,system
+namespace.vndk.link.default.allow_all_shared_libs = true
+namespace.vndk.link.sphal.allow_all_shared_libs = true
+namespace.vndk.link.system.allow_all_shared_libs = true
+
+namespace.system.isolated = false
+namespace.system.visible = true
+namespace.system.search.paths = /system/lib/bootstrap:/system/lib:/system_ext/lib:{vndk_lib}:/vendor/lib
+namespace.system.permitted.paths = /system/lib:/system_ext/lib:{vndk_root}:/vendor:/odm
+namespace.system.links = default,sphal,vndk
+namespace.system.link.default.allow_all_shared_libs = true
+namespace.system.link.sphal.allow_all_shared_libs = true
+namespace.system.link.vndk.allow_all_shared_libs = true
+
+[odm]
+additional.namespaces = sphal,vndk,system
+
+namespace.default.isolated = false
+namespace.default.visible = true
+namespace.default.search.paths = /odm/lib:/vendor/lib:/vendor/lib/vndk:/vendor/lib/vndk-sp:/vendor/lib/hw:{vndk_lib}:/system/lib/bootstrap:/system/lib
+namespace.default.permitted.paths = /odm:/vendor:{vndk_root}:/system/lib
+namespace.default.links = sphal,vndk,system
+namespace.default.link.sphal.allow_all_shared_libs = true
+namespace.default.link.vndk.allow_all_shared_libs = true
+namespace.default.link.system.allow_all_shared_libs = true
+
+namespace.sphal.isolated = false
+namespace.sphal.visible = true
+namespace.sphal.search.paths = /odm/lib:/vendor/lib:/vendor/lib/egl:/vendor/lib/hw:{vndk_lib}:/system/lib/bootstrap:/system/lib
+namespace.sphal.permitted.paths = /odm:/vendor:{vndk_root}:/system/lib
+
+namespace.vndk.isolated = false
+namespace.vndk.visible = true
+namespace.vndk.search.paths = {vndk_lib}:/system/lib/bootstrap:/system/lib:/vendor/lib
+namespace.vndk.permitted.paths = {vndk_root}:/system/lib:/vendor:/odm
+
+namespace.system.isolated = false
+namespace.system.visible = true
+namespace.system.search.paths = /system/lib/bootstrap:/system/lib:/system_ext/lib:{vndk_lib}
+namespace.system.permitted.paths = /system/lib:/system_ext/lib:{vndk_root}
+
+[system]
+additional.namespaces = sphal,vndk
+
+namespace.default.isolated = false
+namespace.default.visible = true
+namespace.default.search.paths = /system/lib/bootstrap:/system/lib:/system_ext/lib:/product/lib:{vndk_lib}:/vendor/lib:/vendor/lib/hw
+namespace.default.permitted.paths = /system:/system_ext:/product:{vndk_root}:/vendor:/odm
+namespace.default.links = sphal,vndk
+namespace.default.link.sphal.allow_all_shared_libs = true
+namespace.default.link.vndk.allow_all_shared_libs = true
+
+namespace.sphal.isolated = false
+namespace.sphal.visible = true
+namespace.sphal.search.paths = /odm/lib:/vendor/lib:/vendor/lib/egl:/vendor/lib/hw:{vndk_lib}:/system/lib/bootstrap:/system/lib
+namespace.sphal.permitted.paths = /odm:/vendor:{vndk_root}:/system/lib
+
+namespace.vndk.isolated = false
+namespace.vndk.visible = true
+namespace.vndk.search.paths = {vndk_lib}:/system/lib/bootstrap:/system/lib:/vendor/lib
+namespace.vndk.permitted.paths = {vndk_root}:/system/lib:/vendor:/odm
+"""
+    cfg_arm_path = final_sys / "etc" / "ld.config.arm"
+    cfg_arm_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_arm_path.write_text(ld_cfg_arm, encoding="utf-8")
+    cfg_arm_path.chmod(0o644)
+
+    # 4. Preserve exact SELinux labels (e.g. same_process_hal_file, vndk_sp_file) for /lib/ from Base file_contexts
+    for p_name in ("system", "system_ext"):
+        b_fc = base_dir / "config" / f"{p_name}_file_contexts"
+        f_fc = final_dir / "config" / f"{p_name}_file_contexts"
+        if b_fc.is_file() and f_fc.is_file():
+            existing = set(
+                ln.split()[0] for ln in f_fc.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()
+            )
+            extra_fc = []
+            for ln in b_fc.read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = ln.strip().split()
+                if len(parts) >= 2 and ("/lib/" in parts[0] or parts[0].endswith("/lib") or "linker" in parts[0]):
+                    if parts[0] not in existing:
+                        extra_fc.append(ln)
+                        existing.add(parts[0])
+            if extra_fc:
+                with open(f_fc, "a", encoding="utf-8") as f:
+                    f.write("\n".join(extra_fc) + "\n")
+
+    print(
+        f"  [32BIT-HAL-BRIDGE] تم زرع مفسر 32-بت (/system/bin/linker -> ld.config.arm) + {copied_32} مكتبة 32-بت لتشغيل الصوت والفيديو دون المساس بـ Zygote64!",
+        flush=True,
+    )
 
 
 def transplant_vndk_and_selinux_mappings(base_dir: Path, final_dir: Path):
@@ -1170,6 +1408,16 @@ def reconcile_selinux_configs(part_dir: Path, config_dir: Path, part_name: str):
                     inherited_ctx = "u:object_r:sepolicy_file:s0"
                 elif fc_key.endswith("/netbpfload_414"):
                     inherited_ctx = "u:object_r:bpfloader_exec:s0"
+                elif re.search(r"/bin/(bootstrap/)?linker(64|_asan|_asan64|_hwasan64)?$", fc_key):
+                    inherited_ctx = "u:object_r:system_linker_exec:s0"
+                elif re.search(r"/bin/crash_dump(32|64)$", fc_key):
+                    inherited_ctx = "u:object_r:crash_dump_exec:s0"
+                elif "/etc/ld.config" in fc_key:
+                    inherited_ctx = "u:object_r:system_linker_config_file:s0"
+                elif part_name not in ("vendor", "odm") and ("/lib/bootstrap" in fc_key or "/lib64/bootstrap" in fc_key):
+                    inherited_ctx = "u:object_r:system_bootstrap_lib_file:s0"
+                elif part_name not in ("vendor", "odm") and (re.search(r"/lib(64)?(/|$)", fc_key)) and inherited_ctx == default_ctx:
+                    inherited_ctx = "u:object_r:system_lib_file:s0"
                 new_fc_lines.append(f"/{re.escape(part_name)}/{re.escape(rel)} {inherited_ctx}")
                 known_fc_map[fc_key] = inherited_ctx
 
