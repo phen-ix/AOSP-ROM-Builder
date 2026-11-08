@@ -1026,12 +1026,38 @@ def transplant_32bit_vendor_hal_bridge(base_dir: Path, final_dir: Path):
                 (f_boot_bin / bl).chmod(0o755)
 
     # 2. Transplant 32-bit Bionic bootstrap + LLNDK/system libs (/system/lib & /system_ext/lib)
-    copied_32 = 0
-    if (base_sys / "lib").is_dir():
-        shutil.copytree(base_sys / "lib", final_sys / "lib", symlinks=True, dirs_exist_ok=True)
-        copied_32 += sum(1 for _ in (final_sys / "lib").rglob("*.so"))
-    if (base_dir / "system_ext" / "lib").is_dir():
-        shutil.copytree(base_dir / "system_ext" / "lib", final_dir / "system_ext" / "lib", symlinks=True, dirs_exist_ok=True)
+    def merge_lib32_dir(src_root: Path, dst_root: Path):
+        if not src_root.is_dir():
+            return
+        for dirpath, dirnames, filenames in os.walk(src_root, followlinks=False):
+            # Skip kernel modules symlink/dir (GKI /system_dlkm/lib/modules)
+            dirnames[:] = [d for d in dirnames if d != "modules"]
+            rel_d = Path(dirpath).relative_to(src_root)
+            target_d = dst_root / rel_d
+            if not os.path.lexists(target_d):
+                target_d.mkdir(parents=True, exist_ok=True)
+            for dname in list(dirnames):
+                s_sub = Path(dirpath) / dname
+                t_sub = target_d / dname
+                if s_sub.is_symlink():
+                    if not os.path.lexists(t_sub):
+                        os.symlink(os.readlink(s_sub), t_sub)
+                    dirnames.remove(dname)
+            for fname in filenames:
+                if fname == "modules":
+                    continue
+                s_f = Path(dirpath) / fname
+                t_f = target_d / fname
+                if os.path.lexists(t_f):
+                    continue
+                if s_f.is_symlink():
+                    os.symlink(os.readlink(s_f), t_f)
+                elif s_f.is_file():
+                    shutil.copy2(s_f, t_f, follow_symlinks=False)
+
+    merge_lib32_dir(base_sys / "lib", final_sys / "lib")
+    merge_lib32_dir(base_dir / "system_ext" / "lib", final_dir / "system_ext" / "lib")
+    copied_32 = sum(1 for p in (final_sys / "lib").rglob("*.so") if not p.is_symlink()) if (final_sys / "lib").is_dir() else 0
 
     # Extract 32-bit ICU core .so from Base com.android.i18n.apex for transitive VNDK dependencies (e.g. libxml2.so)
     if (base_sys / "apex").is_dir():
