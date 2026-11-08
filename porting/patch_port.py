@@ -340,6 +340,7 @@ def collect_exported_elf_symbols(final_dir: Path, is_64: bool = True) -> tuple[s
 
     sonames: set[str] = {
         "libc.so", "libm.so", "libdl.so", "libdl_android.so", "ld-android.so",
+        "libnativehelper.so", "libdexfile.so", "libart.so", "libicu.so",
     }
     exported: set[str] = set()
     if not readelf:
@@ -685,28 +686,47 @@ def fix_joyeuse_nxp_nfc(base_dir: Path, final_dir: Path, only_64bit: bool):
         ("product", base_dir / "product", final_dir / "product"),
     ]
 
-    has_nqnfc = any(
-        "nqnfcnci" in p.name.lower()
-        for _, _, f_root in part_pairs
+    base_nqnfc_cands = [
+        (label, sub, cand, f_root)
+        for label, b_root, f_root in part_pairs
         for sub in ("app", "priv-app")
-        if (f_root / sub).is_dir()
-        for p in (f_root / sub).iterdir()
-    )
+        if (b_root / sub).is_dir()
+        for cand in (b_root / sub).iterdir()
+        if "nqnfcnci" in cand.name.lower() and cand.is_dir()
+    ]
 
-    if not has_nqnfc:
-        for label, b_root, f_root in part_pairs:
-            for sub in ("app", "priv-app"):
-                b_sub = b_root / sub
-                if not b_sub.is_dir():
-                    continue
-                for cand in b_sub.iterdir():
-                    if "nqnfcnci" in cand.name.lower() and cand.is_dir():
-                        dst = f_root / sub / cand.name
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copytree(cand, dst, symlinks=True, dirs_exist_ok=True)
-                        shutil.rmtree(dst / "oat", ignore_errors=True)
-                        print(f"  [NFC-NXP] تم زرع {cand.name} في {label}/{sub} (مع حذف oat/ القديم للتوافق مع ART الجديد)", flush=True)
-                        has_nqnfc = True
+    if base_nqnfc_cands:
+        # Remove Port's modern AIDL NQNfcNci* (including product/pangu/system) so joyeuse uses Base's HIDL NQNfcNci*
+        extra_app_dirs = [
+            f_root / sub
+            for _, _, f_root in part_pairs
+            for sub in ("app", "priv-app")
+        ] + [
+            final_dir / "product" / "pangu" / "system" / "app",
+            final_dir / "product" / "pangu" / "system" / "priv-app",
+        ]
+        for ad in extra_app_dirs:
+            if ad.is_dir():
+                for p in list(ad.iterdir()):
+                    if "nqnfcnci" in p.name.lower() and p.is_dir():
+                        shutil.rmtree(p, ignore_errors=True)
+        for label, sub, cand, f_root in base_nqnfc_cands:
+            dst = f_root / sub / cand.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(cand, dst, symlinks=True, dirs_exist_ok=True)
+            shutil.rmtree(dst / "oat", ignore_errors=True)
+            print(f"  [NFC-NXP] تم استبدال/زرع {cand.name} من Base في {label}/{sub} (مع حذف oat/ للتوافق مع ART الجديد)", flush=True)
+
+    # Always strip stale oat/ from any NQNfcNci* across final (including pangu overlay)
+    for ad in (
+        *(f_root / sub for _, _, f_root in part_pairs for sub in ("app", "priv-app")),
+        final_dir / "product" / "pangu" / "system" / "app",
+        final_dir / "product" / "pangu" / "system" / "priv-app",
+    ):
+        if ad.is_dir():
+            for p in ad.iterdir():
+                if "nqnfcnci" in p.name.lower() and p.is_dir():
+                    shutil.rmtree(p / "oat", ignore_errors=True)
 
     # Also ensure any existing NQNfcNci in final from cross-SDK transplant has no stale oat/ if transplanted
     lib_subs = ("lib64",) if only_64bit else ("lib64", "lib")
