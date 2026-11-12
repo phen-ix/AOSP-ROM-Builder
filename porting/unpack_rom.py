@@ -129,12 +129,24 @@ part_name = sys.argv[2]
 fs_cfg_out = sys.argv[3]
 fc_out = sys.argv[4]
 
-def get_selinux(path):
+IS_VENDOR_LIKE = part_name in ("vendor", "odm")
+DEFAULT_CTX = "u:object_r:vendor_file:s0" if IS_VENDOR_LIKE else "u:object_r:system_file:s0"
+
+def escape_fc(s):
+    return re.sub(r"([.+[\](){}^$?*|\\])", r"\\\1", s)
+
+def get_selinux(path, rel=""):
+    ctx = DEFAULT_CTX
     try:
         val = os.getxattr(path, b"security.selinux", follow_symlinks=False)
-        return val.rstrip(b"\x00").decode("utf-8", errors="ignore")
+        parsed = val.rstrip(b"\x00").decode("utf-8", errors="ignore").strip()
+        if parsed:
+            ctx = parsed
     except OSError:
-        return "u:object_r:system_file:s0"
+        pass
+    if part_name == "vendor" and (rel == "overlay" or rel.startswith("overlay/")) and ctx == "u:object_r:vendor_file:s0":
+        ctx = "u:object_r:vendor_overlay_file:s0"
+    return ctx
 
 def get_caps(path):
     try:
@@ -152,11 +164,12 @@ fs_lines = []
 fc_lines = []
 
 root_st = os.lstat(mnt_dir)
+root_gid = 2000 if IS_VENDOR_LIKE else root_st.st_gid
 root_ctx = get_selinux(mnt_dir)
-fs_lines.append(f"/ {root_st.st_uid} {root_st.st_gid} {stat.S_IMODE(root_st.st_mode):04o}")
-fs_lines.append(f"{part_name}/ {root_st.st_uid} {root_st.st_gid} {stat.S_IMODE(root_st.st_mode):04o}")
+fs_lines.append(f"/ {root_st.st_uid} {root_gid} {stat.S_IMODE(root_st.st_mode):04o}")
+fs_lines.append(f"{part_name}/ {root_st.st_uid} {root_gid} {stat.S_IMODE(root_st.st_mode):04o}")
 fc_lines.append(f"/ {root_ctx}")
-fc_lines.append(f"/{re.escape(part_name)}(/.*)? {root_ctx}")
+fc_lines.append(f"/{escape_fc(part_name)}(/.*)? {root_ctx}")
 
 for dirpath, dirnames, filenames in os.walk(mnt_dir, followlinks=False):
     entries = sorted(dirnames + filenames)
@@ -166,9 +179,9 @@ for dirpath, dirnames, filenames in os.walk(mnt_dir, followlinks=False):
         st = os.lstat(full)
         mode = stat.S_IMODE(st.st_mode)
         caps = "" if stat.S_ISLNK(st.st_mode) else get_caps(full)
-        ctx = get_selinux(full)
+        ctx = get_selinux(full, rel)
         fs_lines.append(f"{part_name}/{rel} {st.st_uid} {st.st_gid} {mode:04o}{caps}")
-        fc_lines.append(f"/{re.escape(part_name)}/{re.escape(rel)} {ctx}")
+        fc_lines.append(f"/{escape_fc(part_name)}/{escape_fc(rel)} {ctx}")
 
 with open(fs_cfg_out, "w", encoding="utf-8") as f:
     f.write("\n".join(fs_lines) + "\n")

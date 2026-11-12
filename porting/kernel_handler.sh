@@ -32,10 +32,12 @@ pushd "$BOOT_TMP" >/dev/null
 magiskboot unpack -h boot.img
 
 # ==============================================================================
-# [2/4] تعديل fstab داخل ramdisk لدعم EROFS والبارتيشنات المنطقية الجديدة وإلغاء AVB
+# [2/4] تعديل fstab الموجود فعلياً داخل ramdisk (مثل fstab.default) لدعم EROFS
+# تنبيه حرج: لا ننشئ fstab.qcom مختصراً داخل ramdisk إذا لم يكن موجوداً بالأصل
+# حتى لا يحجب /vendor/etc/fstab.qcom المسؤول عن ربط /data (FBEv2) و /metadata!
 # ==============================================================================
 if [ -f "ramdisk.cpio" ]; then
-  echo "=== [2/4] تحديث fstab داخل ramdisk.cpio لدعم EROFS والواجهات الكاملة ==="
+  echo "=== [2/4] تحديث fstab داخل ramdisk.cpio لدعم EROFS بدون حجب /vendor/etc/fstab.qcom ==="
   mkdir -p ramdisk_root
   pushd ramdisk_root >/dev/null
   sudo cpio -idmu < ../ramdisk.cpio 2>/dev/null || true
@@ -52,21 +54,14 @@ spec = importlib.util.spec_from_file_location("patch_port", str(script_dir / "pa
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
-for fstab in pathlib.Path(".").rglob("fstab*"):
-    if fstab.is_file():
+patched_any = False
+for fstab in sorted(pathlib.Path(".").rglob("fstab*")):
+    if fstab.is_file() and fstab.name != "fstab.emmc":
         mod.patch_fstab_file(fstab, logical_parts, disable_dfe)
+        patched_any = True
 
-# Ensure fstab.qcom exists for androidboot.hardware=qcom first-stage mount
-if pathlib.Path("fstab.default").is_file() and not pathlib.Path("fstab.qcom").exists():
-    import shutil
-    shutil.copy2("fstab.default", "fstab.qcom")
-    print("  [FSTAB] تم إنشاء fstab.qcom داخل ramdisk لضمان إقلاع المرحلة الأولى لـ qcom", flush=True)
-if pathlib.Path("fstab.qcom").is_file():
-    fsr = pathlib.Path("first_stage_ramdisk")
-    fsr.mkdir(exist_ok=True)
-    if not (fsr / "fstab.qcom").exists():
-        import shutil
-        shutil.copy2("fstab.qcom", fsr / "fstab.qcom")
+if not patched_any:
+    print("No existing ramdisk fstab; leaving vendor fstab authoritative")
 PYEOF
 
   sudo find . -mindepth 1 | LC_ALL=C sort | sudo cpio -o -H newc > ../ramdisk.cpio.new 2>/dev/null
@@ -76,7 +71,7 @@ PYEOF
 fi
 
 # ==============================================================================
-# [3/4] معالجة الكيرنل حسب الوضع المختار (keep_base / custom_url / compile_nexusbase)
+# [3/4] معالجة الكيرنل حسب الوضع المختار
 # ==============================================================================
 if [ "$KERNEL_MODE" = "custom_url" ] && [ -n "$CUSTOM_KERNEL_URL" ]; then
   echo "=== [3/4] تحميل وحقن الكيرنل المخصص الداعم لـ EROFS + uclamp ==="
@@ -102,7 +97,6 @@ if [ "$KERNEL_MODE" = "custom_url" ] && [ -n "$CUSTOM_KERNEL_URL" ]; then
       echo "  [KERNEL] تم تحديث dtbo.img من حزمة AnyKernel3"
     fi
   else
-    # تعامل معه كملف boot.img مباشر
     mkdir -p "${BOOT_TMP}/cboot"
     cp "$K_DL" "${BOOT_TMP}/cboot/boot.img"
     pushd "${BOOT_TMP}/cboot" >/dev/null
@@ -113,11 +107,7 @@ if [ "$KERNEL_MODE" = "custom_url" ] && [ -n "$CUSTOM_KERNEL_URL" ]; then
   fi
 
 elif [ "$KERNEL_MODE" = "compile_phenix_new" ]; then
-  echo "=== [3/4] ترجمة كيرنل phen-ix/new (فرع uclamp-erofs: KCAL + uclamp + EROFS) ==="
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-    bc flex bison libssl-dev libelf-dev python3 ccache
-
+  echo "=== [3/4] ترجمة كيرنل phen-ix/new (فرع uclamp-erofs: KCAL + uclamp + EROFS + PSI + MEMCG) ==="
   CLANG_DIR="${WORKDIR}/clang12"
   git clone --depth=1 -b lineage-20.0 \
     https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git "$CLANG_DIR"
@@ -128,6 +118,33 @@ elif [ "$KERNEL_MODE" = "compile_phenix_new" ]; then
 
   pushd "$K_SRC" >/dev/null
   make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 vendor/xiaomi/miatoll_defconfig
+
+  # تفعيل خيارات Android 16 / HyperOS 3.0 الحرجة (PSI لـ lmkd، MEMCG، ZRAM LZ4، عدادات VM، وعمال EROFS)
+  ./scripts/config --file out/.config \
+    -e PSI \
+    -d PSI_DEFAULT_DISABLED \
+    -e CGROUP_SCHED \
+    -e FAIR_GROUP_SCHED \
+    -e MEMCG \
+    -e MEMCG_SWAP \
+    -e MEMCG_SWAP_ENABLED \
+    -e VM_EVENT_COUNTERS \
+    -e UTS_NS \
+    -e CRYPTO_LZ4 \
+    -e LZ4_COMPRESS \
+    -e LZ4_DECOMPRESS \
+    -e EXT4_ENCRYPTION \
+    -e EROFS_FS \
+    -e EROFS_FS_XATTR \
+    -e EROFS_FS_POSIX_ACL \
+    -e EROFS_FS_SECURITY \
+    -e EROFS_FS_ZIP \
+    -e EROFS_FS_PCPU_KTHREAD \
+    -e EROFS_FS_PCPU_KTHREAD_HIPRI \
+    -e IKCONFIG \
+    -e IKCONFIG_PROC
+
+  make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
   make -j"$(nproc)" O=out ARCH=arm64 \
     CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
     CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
@@ -147,13 +164,28 @@ elif [ "$KERNEL_MODE" = "compile_phenix_new" ]; then
     echo "  [DTB] تم تحديث cust-atoll-ab.dtb من كيرنل phen-ix/new"
   fi
 
-  if compgen -G "out/arch/arm64/boot/dts/qcom/*.dtbo" >/dev/null && [ -f "scripts/dtc/mkdtboimg.py" ]; then
-    python3 scripts/dtc/mkdtboimg.py create "${OUT_FW}/dtbo.img.new" --page_size=4096 out/arch/arm64/boot/dts/qcom/*.dtbo && \
-      mv -f "${OUT_FW}/dtbo.img.new" "${OUT_FW}/dtbo.img" && \
-      echo "  [DTBO] تم توليد dtbo.img المخصص لـ joyeuse/miatoll بنجاح" || true
-  fi
+  # حزم ملفات DTBO الأربعة الخاصة بعائلة miatoll فقط (منع حزم لوحات atoll المرجعية الخاطئة!)
+  MIATOLL_DTBOS=(
+    "out/arch/arm64/boot/dts/qcom/curtana-atoll-ab-idp-overlay.dtbo"
+    "out/arch/arm64/boot/dts/qcom/excalibur-atoll-ab-idp-overlay.dtbo"
+    "out/arch/arm64/boot/dts/qcom/gram-atoll-ab-idp-overlay.dtbo"
+    "out/arch/arm64/boot/dts/qcom/joyeuse-atoll-ab-idp-overlay.dtbo"
+  )
+  for dtbo_f in "${MIATOLL_DTBOS[@]}"; do
+    if [ ! -f "$dtbo_f" ]; then
+      echo "::error::ملف شجرة العتاد الفرعي مفقود: $dtbo_f"
+      exit 1
+    fi
+  done
+  python3 scripts/dtc/mkdtboimg.py create "${OUT_FW}/dtbo.img.new" --page_size=4096 "${MIATOLL_DTBOS[@]}"
+  mv -f "${OUT_FW}/dtbo.img.new" "${OUT_FW}/dtbo.img"
+  echo "  [DTBO] تم توليد dtbo.img الدقيق لـ miatoll فقط (4 لوحات: curtana, excalibur, gram, joyeuse)"
+
   if [ -f "out/System.map" ]; then
     cp -f "out/System.map" "${WORKDIR}/kernel_System.map"
+  fi
+  if [ -f "out/.config" ]; then
+    cp -f "out/.config" "${WORKDIR}/kernel_dot_config"
   fi
   popd >/dev/null
   rm -rf "$K_SRC" "$CLANG_DIR"
@@ -166,7 +198,6 @@ elif [ "$KERNEL_MODE" = "compile_nexusbase" ]; then
   K_SRC="${WORKDIR}/kernel_src"
   git clone --depth=1 -b kernel.lnx.4.14.r15-rel https://github.com/phen-ix/nexusbase.git "$K_SRC"
 
-  # دمج fs/erofs من مستودعك kernel_xiaomi_sm6250xx إذا لم يكن موجوداً في nexusbase
   if [ ! -d "${K_SRC}/fs/erofs" ]; then
     echo "  [EROFS] جلب تعريفات نظام ملفات EROFS لنواة 4.14..."
     EROFS_DONOR="$(mktemp -d)"
@@ -235,7 +266,6 @@ for name in ("vbmeta.img", "vbmeta_system.img", "vbmeta_vendor.img"):
             p.write_bytes(data)
             print(f"  [AVB] تم تعطيل Verity/Verification في {name} (flags=0x03)")
     elif name in ("vbmeta.img", "vbmeta_system.img"):
-        # إنشاء صورة AVB0 معطلة التحقق (4KB) إذا لم تكن مرفقة بالروم الأساسي
         buf = bytearray(4096)
         buf[0:4] = b"AVB0"
         buf[4:8] = struct.pack(">I", 1)

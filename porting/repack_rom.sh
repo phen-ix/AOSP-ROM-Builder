@@ -16,8 +16,9 @@ mkdir -p "$IMG_OUT" "$ZIP_STAGE/META-INF/com/google/android" "$OUT_DIR"
 MIATOLL_SUPER_SIZE=8589934592
 MIATOLL_QTI_GROUP_SIZE=8585740288
 
-echo "=== [1/3] بناء صور البارتيشنات بصيغة EROFS المضغوطة (lz4hc,9) ==="
+echo "=== [1/4] بناء صور البارتيشنات بصيغة EROFS المتوافقة مع كيرنل 4.14 (lz4hc,9 @ 4KB cluster) ==="
 mapfile -t PARTS < <(grep -v '^[[:space:]]*$' "${FINAL_DIR}/logical_partitions.txt")
+: > "${WORKDIR}/erofs_summaries.txt"
 
 TOTAL_LOGICAL_BYTES=0
 LPMAKE_PART_ARGS=()
@@ -26,7 +27,6 @@ for part in "${PARTS[@]}"; do
   echo "  -> جاري ضغط بارتيشن [${part}] بصيغة EROFS..."
   mkfs.erofs \
     -zlz4hc,9 \
-    -C262144 \
     -T 1700000000 \
     --ignore-mtime \
     --workers="$(nproc)" \
@@ -36,11 +36,13 @@ for part in "${PARTS[@]}"; do
     "${IMG_OUT}/${part}.img" \
     "${FINAL_DIR}/${part}"
 
-  # فحص سلامة صورة EROFS المولّدة قبل دمجها
   fsck.erofs "${IMG_OUT}/${part}.img" >/dev/null
+  {
+    echo "=== EROFS [${part}] ==="
+    dump.erofs -s "${IMG_OUT}/${part}.img"
+  } >> "${WORKDIR}/erofs_summaries.txt"
   echo "     [FSCK] صورة ${part}.img اجتازت فحص سلامة EROFS بنجاح"
 
-  # حذف المجلد المفكوك فور تحويله لتوفير مساحة القرص
   rm -rf "${FINAL_DIR:?}/${part}"
 
   P_SIZE=$(stat -c%s "${IMG_OUT}/${part}.img")
@@ -55,11 +57,11 @@ done
 
 echo "=== إجمالي حجم البارتيشنات المنطقية = $((TOTAL_LOGICAL_BYTES / 1024 / 1024)) MB من أصل $((MIATOLL_QTI_GROUP_SIZE / 1024 / 1024)) MB ==="
 if [ "$TOTAL_LOGICAL_BYTES" -ge "$MIATOLL_QTI_GROUP_SIZE" ]; then
-  echo "::error::حجم البارتيشنات ($TOTAL_LOGICAL_BYTES bytes) تجاوز السعة القصوى لـ super في miatoll ($MIATOLL_QTI_GROUP_SIZE bytes)! يرجى تفعيل خيار Debloat."
+  echo "::error::حجم البارتيشنات ($TOTAL_LOGICAL_BYTES bytes) تجاوز السعة القصوى لـ super في miatoll ($MIATOLL_QTI_GROUP_SIZE bytes)!"
   exit 1
 fi
 
-echo "=== [2/3] تجميع حاوية super.img الموحدة لعائلة joyeuse / miatoll ==="
+echo "=== [2/4] تجميع حاوية super.img الموحدة لعائلة joyeuse / miatoll ==="
 lpmake \
   --metadata-size 65536 \
   --super-name super \
@@ -69,8 +71,12 @@ lpmake \
   "${LPMAKE_PART_ARGS[@]}" \
   --output "${ZIP_STAGE}/super.img"
 
-# حذف الصور المنفردة بعد دمجها في super.img لتوفير 5GB+
+lpdumps "${ZIP_STAGE}/super.img" > "${WORKDIR}/super_lpdump.txt"
 rm -rf "$IMG_OUT"
+
+echo "=== [3/4] ضغط super.img بصيغة Zstandard السريعة (super.img.zst < 4 GiB) ==="
+zstd -3 -T0 --rm "${ZIP_STAGE}/super.img" -o "${ZIP_STAGE}/super.img.zst"
+ls -lh "${ZIP_STAGE}/super.img.zst"
 
 # نسخ ملفات الإقلاع والـ vbmeta
 for fw in boot.img dtbo.img vbmeta.img vbmeta_system.img vbmeta_vendor.img; do
@@ -79,90 +85,40 @@ for fw in boot.img dtbo.img vbmeta.img vbmeta_system.img vbmeta_vendor.img; do
   fi
 done
 
-echo "=== [3/3] إنشاء ملف الـ ZIP الهجين (يعمل من الريكفري OrangeFox/TWRP ومن Fastboot) ==="
+echo "=== [4/4] تجهيز مثبت الريكفري الثابت ARM64 (Static ELF64 update-binary) وحزم الـ ZIP ==="
+if [ ! -x "/usr/local/bin/miatoll-update-binary-arm64" ]; then
+  echo "::error::مثبت الريكفري المترجم /usr/local/bin/miatoll-update-binary-arm64 غير موجود!"
+  exit 1
+fi
 
-cat > "${ZIP_STAGE}/META-INF/com/google/android/updater-script" << 'EOF'
-#MAGISK
-EOF
+cp -f "/usr/local/bin/miatoll-update-binary-arm64" "${ZIP_STAGE}/META-INF/com/google/android/update-binary"
+chmod 0755 "${ZIP_STAGE}/META-INF/com/google/android/update-binary"
+printf '#MAGISK\n' > "${ZIP_STAGE}/META-INF/com/google/android/updater-script"
 
-cat > "${ZIP_STAGE}/META-INF/com/google/android/update-binary" << 'EOF'
-#!/sbin/sh
-OUTFD="$2"
-ZIPFILE="$3"
-
-ui_print() {
-  echo "ui_print $1" > "/proc/self/fd/$OUTFD"
-  echo "ui_print" > "/proc/self/fd/$OUTFD"
-}
-
-find_block() {
-  local name="$1"
-  for base in /dev/block/bootdevice/by-name /dev/block/by-name /dev/block/platform/soc/1d84000.ufshc/by-name; do
-    if [ -e "${base}/${name}" ]; then
-      echo "${base}/${name}"
-      return 0
-    fi
-  done
-  return 1
-}
-
-flash_entry() {
-  local file="$1"
-  local part="$2"
-  if unzip -l "$ZIPFILE" "$file" >/dev/null 2>&1; then
-    local blk
-    blk=$(find_block "$part") || {
-      ui_print "! تحذير: لم يتم العثور على مسار البارتيشن $part"
-      return 1
-    }
-    ui_print "- جاري تفليش ${part}..."
-    unzip -p "$ZIPFILE" "$file" > "$blk"
-  fi
-}
-
-ui_print "=========================================="
-ui_print "   joyeuse / miatoll EROFS + uclamp Port  "
-ui_print "=========================================="
-
-HW=$(getprop ro.boot.hwname)
-DEV=$(getprop ro.product.device)
-ui_print "- الجهاز المكتشف: ${HW:-$DEV}"
-
-flash_entry "vbmeta.img" "vbmeta"
-flash_entry "vbmeta_system.img" "vbmeta_system"
-flash_entry "vbmeta_vendor.img" "vbmeta_vendor" || true
-flash_entry "dtbo.img" "dtbo"
-flash_entry "boot.img" "boot"
-
-ui_print "- جاري تفليش حاوية النظام super.img (EROFS)..."
-ui_print "  (قد يستغرق ذلك 1-2 دقيقة، يرجى الانتظار)"
-flash_entry "super.img" "super"
-
-ui_print "=========================================="
-ui_print "✅ اكتمل تفليش الروم بنجاح!"
-ui_print "ℹ️ عند التحويل من روم مختلف يُنصح بعمل Format Data"
-ui_print "=========================================="
-exit 0
-EOF
-chmod +x "${ZIP_STAGE}/META-INF/com/google/android/update-binary"
-
-# إضافة سكربتات التفليش عبر Fastboot للكمبيوتر أيضاً (اختياري للمستخدم)
 cat > "${ZIP_STAGE}/flash_fastboot_linux.sh" << 'EOF'
 #!/usr/bin/env bash
-set -e
-echo "Flashing joyeuse / miatoll Port ROM via Fastboot..."
+set -euo pipefail
+echo "Flashing joyeuse / miatoll HyperOS 3.0 Port ROM via Fastboot..."
+if [ -f super.img.zst ] && [ ! -f super.img ]; then
+  echo "Decompressing super.img.zst..."
+  zstd -d super.img.zst -o super.img
+fi
 [ -f vbmeta.img ] && fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img
 [ -f vbmeta_system.img ] && fastboot --disable-verity --disable-verification flash vbmeta_system vbmeta_system.img
 [ -f dtbo.img ] && fastboot flash dtbo dtbo.img
 [ -f boot.img ] && fastboot flash boot boot.img
 fastboot flash super super.img
-echo "Done! Format data (fastboot -w) if clean flashing, then run: fastboot reboot"
+echo "Done! Run 'fastboot -w' if clean flashing, then 'fastboot reboot'."
 EOF
 chmod +x "${ZIP_STAGE}/flash_fastboot_linux.sh"
 
 cat > "${ZIP_STAGE}/flash_fastboot_windows.bat" << 'EOF'
 @echo off
-echo Flashing joyeuse / miatoll Port ROM via Fastboot...
+echo Flashing joyeuse / miatoll HyperOS 3.0 Port ROM via Fastboot...
+if exist super.img.zst if not exist super.img (
+  echo Decompressing super.img.zst...
+  zstd -d super.img.zst -o super.img
+)
 if exist vbmeta.img fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img
 if exist vbmeta_system.img fastboot --disable-verity --disable-verification flash vbmeta_system vbmeta_system.img
 if exist dtbo.img fastboot flash dtbo dtbo.img
@@ -178,8 +134,8 @@ FINAL_ZIP_NAME="${SAFE_LABEL}-joyeuse-miatoll-EROFS-uclamp-${DATE_TAG}.zip"
 FINAL_ZIP_PATH="${OUT_DIR}/${FINAL_ZIP_NAME}"
 
 pushd "$ZIP_STAGE" >/dev/null
-# استخدام مستوى ضغط سريع -1 لأن بارتيشنات EROFS مضغوطة مسبقاً بـ lz4hc,9
-zip -1 -r "$FINAL_ZIP_PATH" .
+# تخزين مباشر بدون ضغط مزدوج (-0) لأن super.img.zst و boot.img مضغوطة مسبقاً ولضمان البث المباشر في الريكفري
+zip -0 -r "$FINAL_ZIP_PATH" .
 popd >/dev/null
 
 rm -rf "$ZIP_STAGE"

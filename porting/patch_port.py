@@ -272,12 +272,13 @@ def set_or_update_props(prop_file: Path, updates: dict[str, str]):
 def copy_hardware_overlays(base_product: Path, final_product: Path):
     base_ov = base_product / "overlay"
     final_ov = final_product / "overlay"
-    if not base_ov.is_dir() or not final_ov.is_dir():
+    if not base_ov.is_dir():
         return
+    final_ov.mkdir(parents=True, exist_ok=True)
     # DevicesOverlay.apk is signed with Xiaomi's official key and carries LCD brightness curves,
     # cutout dimensions, and side-fingerprint coordinates for joyeuse/miatoll.
-    force_replace = {"devicesoverlay.apk"}
-    hw_patterns = ("miatoll", "joyeuse", "atoll", "sm6250", "cutout", "notch", "wifi", "tethering", "carrierconfig")
+    force_replace = {"devicesoverlay.apk", "devicesandroidoverlay.apk", "aospframeworkresoverlay.apk"}
+    hw_patterns = ("miatoll", "joyeuse", "atoll", "sm6250", "cutout", "notch", "wifi", "tethering", "carrierconfig", "settingsrrodevice")
     copied = 0
     for item in base_ov.iterdir():
         lname = item.name.lower()
@@ -927,18 +928,6 @@ def transplant_miatoll_hal_fixes(base_dir: Path, final_dir: Path):
             )
         print("  [BOOT-FIX] تم حقن xd_port_fixes.xml لمنع انهيار CollectRunningTasksService عند الإقلاع", flush=True)
 
-    # 6. Merge product/pangu/system -> product if pangu split exists, then purge ST NFC & transplant joyeuse NXP NFC
-    pangu_sys = final_dir / "product" / "pangu" / "system"
-    if pangu_sys.is_dir():
-        for sub in pangu_sys.iterdir():
-            dest_sub = final_dir / "product" / sub.name
-            if sub.is_dir():
-                shutil.copytree(sub, dest_sub, symlinks=True, dirs_exist_ok=True)
-            else:
-                shutil.copy2(sub, dest_sub, follow_symlinks=False)
-        shutil.rmtree(final_dir / "product" / "pangu", ignore_errors=True)
-        print("  [PANGU-MERGE] تم دمج product/pangu/system داخل product لتقليل التكرار", flush=True)
-
     fix_joyeuse_nxp_nfc(base_dir, final_dir, only_64bit=only_64)
     fix_sm6250_ril_and_region(base_dir, final_dir)
     patch_android16_netbpfload_for_414(final_dir)
@@ -1291,6 +1280,8 @@ def run_smart_debloat(final_dir: Path):
 
     def is_protected(name: str) -> bool:
         low = name.lower()
+        if low in ("biometric", "miuibiometric", "miuiaod"):
+            return True
         # Never confuse Chrome browser (TrichromeChrome) with TrichromeLibrary/WebView
         if "trichromechrome" in low or low in ("chrome", "chromestub"):
             return False
@@ -1444,7 +1435,7 @@ def reconcile_selinux_configs(part_dir: Path, config_dir: Path, part_name: str):
                     inherited_ctx = "u:object_r:system_bootstrap_lib_file:s0"
                 elif part_name not in ("vendor", "odm") and (re.search(r"/lib(64)?(/|$)", fc_key)) and inherited_ctx == default_ctx:
                     inherited_ctx = "u:object_r:system_lib_file:s0"
-                new_fc_lines.append(f"/{re.escape(part_name)}/{re.escape(rel)} {inherited_ctx}")
+                new_fc_lines.append(f"/{escape_fc(part_name)}/{escape_fc(rel)} {inherited_ctx}")
                 known_fc_map[fc_key] = inherited_ctx
 
     if new_fs_lines:
@@ -1454,6 +1445,228 @@ def reconcile_selinux_configs(part_dir: Path, config_dir: Path, part_name: str):
         with open(fc_cfg, "a", encoding="utf-8") as f:
             f.write("\n".join(new_fc_lines) + "\n")
     print(f"  [SELINUX] {part_name}: تمت مزامنة {len(new_fs_lines)} مسار جديد في fs_config/file_contexts", flush=True)
+
+
+
+def escape_fc(value):
+    return re.sub(r"([.+[\](){}^$?*|\\])", r"\\\1", value)
+
+
+def fold_split_layout(final_dir: Path):
+    """Fold split donor trees while remapping their exact filesystem metadata."""
+    cfg = final_dir / "config"
+    sysrel = "system/system" if (final_dir / "system/system").is_dir() else "system"
+
+    def merge(source, destination, srcpart, dstpart):
+        src, dst = final_dir / source, final_dir / destination
+        if not src.is_dir() or src.is_symlink():
+            return
+        dst.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+        for suffix in ("fs_config", "file_contexts"):
+            inp, out = cfg / f"{srcpart}_{suffix}", cfg / f"{dstpart}_{suffix}"
+            if not inp.exists():
+                continue
+            old = source if suffix == "fs_config" else "/" + escape_fc(source)
+            new = destination if suffix == "fs_config" else "/" + escape_fc(destination)
+            mapped = []
+            for line in inp.read_text().splitlines():
+                key, sep, rest = line.partition(" ")
+                if key == old or key.startswith(old + "/"):
+                    mapped.append(new + key[len(old):] + sep + rest)
+            with out.open("a") as f:
+                f.write("\n" + "\n".join(mapped) + "\n")
+        shutil.rmtree(src)
+
+    for part in ("product", "system_ext", "system"):
+        merge("mi_ext/" + part, sysrel if part == "system" else part, "mi_ext", part)
+    extra = final_dir / "mi_ext/etc/build.prop"
+    if extra.is_file():
+        target = final_dir / "product/etc/build.prop"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a") as f:
+            f.write("\n" + "\n".join(l for l in extra.read_text().splitlines()
+                if "=" in l and not l.lstrip().startswith(("ro.product.", "ro.build.", "ro.system."))) + "\n")
+    shutil.rmtree(final_dir / "mi_ext", ignore_errors=True)
+    miext = final_dir / sysrel / "mi_ext"
+    miext.mkdir(parents=True, exist_ok=True)
+    for name in ("product", "system_ext", "system"):
+        link = miext / name
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to("/" + name)
+    merge("product/pangu/system", sysrel, "product", "system")
+    pangu = final_dir / "product/pangu"
+    pangu.mkdir(parents=True, exist_ok=True)
+    if not (pangu / "system").exists() and not (pangu / "system").is_symlink():
+        (pangu / "system").symlink_to("/system")
+    for root in (final_dir / "system", final_dir / "system_ext", final_dir / "product"):
+        for rc in root.rglob("init.miui.mi_ext.rc"):
+            rc.write_text("# mi_ext folded into physical logical partitions\n")
+
+
+def harden_runtime_properties(final_dir: Path):
+    sysroot = final_dir / "system/system"
+    if not sysroot.is_dir():
+        sysroot = final_dir / "system"
+    updates = {"ro.product.device": "joyeuse", "ro.build.product": "joyeuse",
+        "ro.product.system.device": "joyeuse", "ro.product.product.device": "joyeuse",
+        "ro.product.system_ext.device": "joyeuse", "ro.miui.cust_erofs": "0",
+        "debug.hwui.renderer": "skiagl", "ro.surface_flinger.game_default_frame_rate_override": "60",
+        "ro.control_privapp_permissions": "log", "dalvik.vm.dex2oat64.enabled": "true",
+        "ro.mediaserver.64b.enable": "true", "ro.zygote": "zygote64"}
+    for part in ("system", "system_ext", "product"):
+        for prop in (final_dir / part).rglob("*.prop"):
+            lines = prop.read_text(errors="replace").splitlines()
+            lines = [l for l in lines if not l.strip().startswith(("ro.board.", "ro.product.first_api_level=",
+                "ro.vndk.version=", "ro.soc.", "ro.miui.density.primaryscale="))]
+            prop.write_text("\n".join(lines) + "\n")
+            set_or_update_props(prop, updates)
+    for part in ("vendor", "odm"):
+        for name in ("default.prop", "build.prop", "etc/build.prop"):
+            set_or_update_props(final_dir / part / name, {"ro.zygote": "zygote64",
+                f"ro.{part}.product.cpu.abilist": "arm64-v8a",
+                f"ro.{part}.product.cpu.abilist32": "",
+                f"ro.{part}.product.cpu.abilist64": "arm64-v8a",
+                "ro.mediaserver.64b.enable": "true"})
+    for part in ("system", "vendor", "system_ext"):
+        for rc in (final_dir / part).rglob("*.rc"):
+            if rc.name.startswith("boringssl_self_test") or rc.name == "hyper_bpfloader.rc":
+                rc.write_text("\n".join(l for l in rc.read_text().splitlines()
+                    if not l.strip().startswith("reboot_on_failure")) + "\n")
+    for stale in (final_dir / "vendor/etc/selinux").glob("precompiled_sepolicy*"):
+        stale.unlink()
+
+
+
+def install_early_adb(final_dir):
+    from early_adb import patch_auth
+    root = final_dir / "system/system"
+    if not root.is_dir():
+        root = final_dir / "system"
+    candidates = [p for tree in (root, final_dir / "system_ext", final_dir / "product")
+        for p in tree.rglob("*adbd*.apex")]
+    candidates += [p for tree in (root, final_dir / "system_ext", final_dir / "product")
+        for p in tree.rglob("*adbd*.capex")]
+    if not candidates:
+        raise RuntimeError("Donor adbd APEX missing")
+    raw = extract_file_from_apex(candidates[0], "bin/adbd")
+    if not raw:
+        raise RuntimeError("Cannot extract donor adbd")
+    patched, report = patch_auth(raw)
+    (root / "bin/adbd_noauth").write_bytes(patched)
+    (root / "bin/adbd_noauth").chmod(0o755)
+    (final_dir.parent / "adbd_patch_report.json").write_text(json.dumps(report, indent=2))
+    rc = root / "etc/init/hyperos_early_adb.rc"
+    rc.write_text("""# No authentication: trusted development devices only.
+on property:apexd.status=ready
+    mount none /system/bin/adbd_noauth /apex/com.android.adbd/bin/adbd bind
+    setprop persist.sys.usb.config mtp,adb
+    start adbd
+on property:apex.all.ready=true
+    mount none /system/bin/adbd_noauth /apex/com.android.adbd/bin/adbd bind
+    start adbd
+""")
+    cil = root / "etc/selinux/plat_sepolicy.cil"
+    with cil.open("a") as f:
+        f.write("\n(allow init adbd_exec (file (mounton)))\n")
+    for part in ("system", "vendor", "product", "system_ext"):
+        for prop in (final_dir / part).rglob("*.prop"):
+            if prop.name in ("prop.default", "build.prop", "default.prop"):
+                set_or_update_props(prop, {"ro.adb.secure": "0", "ro.secure": "1", "ro.debuggable": "0"})
+        for script in (final_dir / part).rglob("*.rc"):
+            text = script.read_text(errors="replace").replace("--root_seclabel=u:r:su:s0", "")
+            text = "\n".join(l for l in text.splitlines() if not
+                (any(x in l for x in ("resetprop", "xeutoolbox")) and any(x in l for x in ("ro.adb.secure", "ro.debuggable", "ro.secure"))))
+            script.write_text(text + "\n")
+
+
+def reconcile_platform_metadata(final_dir):
+    import hashlib
+    root = final_dir / "system/system"
+    if not root.is_dir():
+        root = final_dir / "system"
+    vendor_sel = final_dir / "vendor/etc/selinux"
+    vers = (vendor_sel / "plat_sepolicy_vers.txt").read_text().strip()
+    for prefix, tree in (("plat", root), ("system_ext", final_dir / "system_ext"), ("product", final_dir / "product")):
+        sel = tree / "etc/selinux"
+        policy, mapping = sel / (prefix + "_sepolicy.cil"), sel / "mapping" / (vers + ".cil")
+        if policy.is_file() and mapping.is_file():
+            digest = hashlib.sha256(policy.read_bytes() + mapping.read_bytes()).hexdigest()
+            (sel / (prefix + "_sepolicy_and_mapping.sha256")).write_text(digest + "\n")
+    # Vendor/ODM own their namespaces; remove donor duplicates, not vendor rules.
+    owned = set()
+    for ctx in (final_dir / "vendor").rglob("*property_contexts"):
+        for line in ctx.read_text().splitlines():
+            bits = line.split()
+            if bits and not bits[0].startswith("#"):
+                owned.add(bits[0])
+    seen = set(owned)
+    for tree in (root, final_dir / "system_ext", final_dir / "product"):
+        for ctx in sorted(tree.rglob("*property_contexts")):
+            lines = []
+            for line in ctx.read_text().splitlines():
+                bits = line.split()
+                if bits and bits[0].startswith(("vendor.", "persist.vendor.", "ro.vendor.", "odm.", "ro.odm.", "persist.odm.")):
+                    if bits[0] in seen:
+                        continue
+                    seen.add(bits[0])
+                lines.append(line)
+            ctx.write_text("\n".join(lines) + "\n")
+    cfg = final_dir / "config"
+    for name in ("vendor", "system"):
+        fc = cfg / (name + "_file_contexts")
+        if not fc.exists():
+            continue
+        lines = []
+        for line in fc.read_text().splitlines():
+            bits = line.split()
+            if len(bits) >= 2:
+                path = bits[0]
+                if path.startswith("/vendor/overlay/"):
+                    bits[-1] = "u:object_r:vendor_overlay_file:s0"
+                elif path.startswith("/vendor/etc/permissions/"):
+                    bits[-1] = "u:object_r:vendor_configs_file:s0"
+                elif path.endswith("/adbd_noauth"):
+                    bits[-1] = "u:object_r:adbd_exec:s0"
+                line = " ".join(bits)
+            lines.append(line)
+        fc.write_text("\n".join(lines) + "\n")
+
+
+
+def transplant_vintf_compatibility(base_dir, final_dir):
+    import xml.etree.ElementTree as ET
+    def system_root(folder):
+        return folder / "system/system" if (folder / "system/system").is_dir() else folder / "system"
+    source = system_root(base_dir) / "etc/vintf"
+    target = system_root(final_dir) / "etc/vintf"
+    target.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        for matrix in source.glob("compatibility_matrix*.xml"):
+            dest = target / matrix.name
+            if not dest.exists():
+                shutil.copy2(matrix, dest)
+    matrix = final_dir / "vendor/etc/vintf/compatibility_matrix.xml"
+    if matrix.is_file():
+        tree = ET.parse(matrix)
+        root = tree.getroot()
+        for tag, version in (("vendor-ndk", "30"), ("system-sdk", "29")):
+            nodes = root.findall(tag)
+            if not nodes:
+                nodes = [ET.SubElement(root, tag)]
+            if not any(v.text == version for node in nodes for v in node.findall("version")):
+                ET.SubElement(nodes[0], "version").text = version
+        tree.write(matrix, encoding="unicode", xml_declaration=True)
+    # Keep kernel-owned millet protocol in sync with the Base vendor value.
+    millet = None
+    for prop in (final_dir / "vendor").rglob("*.prop"):
+        for line in prop.read_text(errors="replace").splitlines():
+            if line.startswith("ro.millet.netlink="):
+                millet = line.partition("=")[2]
+    if millet is not None:
+        for part in ("system", "system_ext", "product"):
+            for prop in (final_dir / part).rglob("*.prop"):
+                set_or_update_props(prop, {"ro.millet.netlink": millet})
 
 
 def main():
@@ -1507,6 +1720,9 @@ def main():
     final_parts = [p for p in preferred_order if (final_dir / p).is_dir()]
     (final_dir / "logical_partitions.txt").write_text("\n".join(final_parts) + "\n", encoding="utf-8")
 
+    fold_split_layout(final_dir)
+    final_parts = [p for p in preferred_order if (final_dir / p).is_dir() and not (final_dir / p).is_symlink()]
+    (final_dir / "logical_partitions.txt").write_text("\n".join(final_parts) + "\n")
     ui_type = detect_ui_type(final_dir, args.ui_type)
     print(f"=== نوع الواجهة المكتشفة للبورت: [{ui_type.upper()}] | البارتيشنات: {final_parts} ===", flush=True)
 
@@ -1520,6 +1736,11 @@ def main():
     if ui_type == "hyperos" and (final_dir / "product").is_dir():
         df_dir = final_dir / "product" / "etc" / "device_features"
         df_dir.mkdir(parents=True, exist_ok=True)
+        for stale in df_dir.glob("*.xml"):
+            stale.unlink()
+        display = base_dir / "product/etc/displayconfig"
+        if display.is_dir():
+            shutil.copytree(display, final_dir / "product/etc/displayconfig", dirs_exist_ok=True)
         base_df = base_dir / "product" / "etc" / "device_features"
         for dev_codename in ("joyeuse", "miatoll", "curtana", "excalibur", "gram"):
             cand = base_df / f"{dev_codename}.xml"
@@ -1528,6 +1749,8 @@ def main():
             xml_content = cand.read_text(encoding="utf-8", errors="ignore") if cand.is_file() else JOYEUSE_HYPEROS_XML
             (df_dir / f"{dev_codename}.xml").write_text(xml_content, encoding="utf-8")
         print("  [HYPEROS] تم تجهيز ملفات خصائص عائلة joyeuse/miatoll الكاملة (بصمة جانبية + NFC + IR + بطارية 5020mAh)", flush=True)
+
+    transplant_vintf_compatibility(base_dir, final_dir)
 
     # 5. Free base_dir & port_dir (keep base/firmware for boot/dtbo/vbmeta)
     for bcleanup in ("product", "system_ext", "system", "odm"):
@@ -1571,8 +1794,8 @@ def main():
     if args.enable_adb_debug.lower() == "true":
         common_props.update({
             "ro.adb.secure": "0",
-            "ro.secure": "0",
-            "ro.debuggable": "1",
+            "ro.secure": "1",
+            "ro.debuggable": "0",
             "persist.sys.usb.config": "mtp,adb",
         })
 
@@ -1594,9 +1817,14 @@ def main():
         "ro.product.marketname": "Redmi Note 9 Pro",
     })
 
+    harden_runtime_properties(final_dir)
+
     # 9. Smart safe debloat
     if args.enable_debloat.lower() == "true":
         run_smart_debloat(final_dir)
+
+    if args.enable_adb_debug.lower() == "true":
+        install_early_adb(final_dir)
 
     # 10. Pre-compile & auto-heal SELinux split CIL policies via secilc before sealing fs_config
     if shutil.which("secilc"):
@@ -1612,6 +1840,8 @@ def main():
     # 11. Reconcile fs_config & file_contexts for every partition
     for part in final_parts:
         reconcile_selinux_configs(final_dir / part, final_cfg, part)
+
+    reconcile_platform_metadata(final_dir)
 
     print("✅ اكتملت تعديلات البورت + EROFS + uclamp بنجاح!", flush=True)
 

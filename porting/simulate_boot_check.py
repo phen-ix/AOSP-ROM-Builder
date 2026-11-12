@@ -12,6 +12,7 @@ Prevents bootloops BEFORE the user downloads/flashes the ROM by simulating:
 
 import argparse
 import gzip
+import zlib
 import os
 import re
 import shutil
@@ -180,6 +181,20 @@ def check_stage1_boot_and_fstab(workdir: Path) -> tuple[bool, str]:
         k_raw = k_bytes
     if len(k_raw) < 64 or k_raw[0x38:0x3C] != b"ARM\x64":
         return False, "صورة الكيرنل داخل boot.img لا تحمل توقيع ARM64 الصحيح!"
+
+    marker = k_raw.find(b"IKCFG_ST")
+    if marker < 0:
+        return False, "Kernel embedded IKCONFIG missing"
+    try:
+        config = zlib.decompress(k_raw[marker + 8:], 31).decode()
+    except Exception as exc:
+        return False, f"Invalid IKCONFIG: {exc}"
+    required = ("PSI", "MEMCG", "MEMCG_SWAP", "MEMCG_SWAP_ENABLED", "FAIR_GROUP_SCHED",
+        "VM_EVENT_COUNTERS", "UTS_NS", "CRYPTO_LZ4", "EXT4_ENCRYPTION", "EROFS_FS",
+        "EROFS_FS_PCPU_KTHREAD", "EROFS_FS_PCPU_KTHREAD_HIPRI", "IKCONFIG_PROC")
+    missing = [k for k in required if f"CONFIG_{k}=y" not in config.splitlines()]
+    if missing:
+        return False, f"Mandatory kernel options missing: {missing}"
 
     # Check EROFS & uclamp symbols/strings inside compiled kernel image
     has_erofs = b"erofs" in k_raw
@@ -550,44 +565,53 @@ def check_stage6_post_repack(workdir: Path) -> tuple[bool, str]:
         return False, "لم يتم العثور على ملف الروم المضغوط (.zip) في output!"
     rom_zip = zips[-1]
 
-    required_entries = {
-        "META-INF/com/google/android/update-binary",
-        "META-INF/com/google/android/updater-script",
-        "boot.img",
-        "dtbo.img",
-        "vbmeta.img",
-        "vbmeta_system.img",
-        "super.img",
-    }
-    with zipfile.ZipFile(rom_zip, "r") as zf:
-        names = set(zf.namelist())
-        missing = required_entries - names
+    required_entries = {"META-INF/com/google/android/update-binary",
+        "META-INF/com/google/android/updater-script", "boot.img", "dtbo.img",
+        "vbmeta.img", "vbmeta_system.img", "super.img.zst"}
+    with zipfile.ZipFile(rom_zip) as zf:
+        missing = required_entries - set(zf.namelist())
         if missing:
-            return False, f"ملفات أساسية مفقودة من أرشيف التفليش: {missing}"
-        ub_bytes = zf.read("META-INF/com/google/android/update-binary")
-
-    # Syntax-check update-binary with sh -n
-    with tempfile.NamedTemporaryFile("wb", suffix=".sh", delete=False) as tf:
-        tf.write(ub_bytes)
-        tf_path = Path(tf.name)
-    try:
-        res = subprocess.run(["sh", "-n", str(tf_path)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if res.returncode != 0:
-            return False, f"خطأ صياغة في سكربت التفليش update-binary: {res.stdout}"
-    finally:
-        tf_path.unlink(missing_ok=True)
-
-    # Inspect super.img metadata via lpdumps if zip_stage/super.img still exists or stream header
-    super_stage = workdir / "zip_stage" / "super.img"
-    lp_info = ""
-    if super_stage.is_file() and shutil.which("lpdumps"):
-        res = subprocess.run(["lpdumps", str(super_stage)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        part_names = re.findall(r"Name:\s+(\S+)", res.stdout or "")
-        if part_names:
-            lp_info = f"، أقسام `super.img` المفحوصة عبر `lpdumps`: `{part_names}`"
-
-    sz_gb = rom_zip.stat().st_size / (1024 ** 3)
-    return True, f"أرشيف التفليش `{rom_zip.name}` ({sz_gb:.2f} GiB) سليم 100% واجتاز محاكاة `update-binary`{lp_info}"
+            return False, f"Missing package members: {missing}"
+        for name in required_entries:
+            if zf.getinfo(name).compress_type != zipfile.ZIP_STORED:
+                return False, f"Installer requires ZIP_STORED: {name}"
+        ub = zf.read("META-INF/com/google/android/update-binary")
+        if ub[:5] != b"\x7fELF\x02" or struct.unpack_from("<H", ub, 18)[0] != 183:
+            return False, "update-binary is not AArch64 ELF64"
+        with zf.open("super.img.zst") as stream:
+            if stream.read(4) != b"\x28\xb5\x2f\xfd":
+                return False, "Invalid Zstandard magic"
+    qemu = shutil.which("qemu-aarch64-static")
+    zstd = shutil.which("zstd")
+    if not qemu or not zstd:
+        return False, "qemu-aarch64-static and zstd are required for installer test"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        binary = root / "update-binary"
+        binary.write_bytes(ub)
+        binary.chmod(0o755)
+        raw = b"MIATOLL_TEST_SUPER" * 65536
+        compressed = subprocess.run([zstd, "-q", "-c"], input=raw, capture_output=True, check=True).stdout
+        expected = {"boot": b"ANDROID!test", "dtbo": b"test dtbo",
+            "vbmeta": b"AVB0test", "vbmeta_system": b"AVB0system", "super": raw}
+        fixture = root / "fixture.zip"
+        with zipfile.ZipFile(fixture, "w", compression=zipfile.ZIP_STORED) as testzip:
+            for name, data in expected.items():
+                testzip.writestr(name + (".img.zst" if name == "super" else ".img"),
+                    compressed if name == "super" else data)
+        blocks = root / "blocks"
+        blocks.mkdir()
+        for name in expected:
+            (blocks / name).touch()
+        env = dict(os.environ, MIATOLL_BLOCK_DIR=str(blocks), MIATOLL_HWNAME_OVERRIDE="joyeuse")
+        run = subprocess.run([qemu, str(binary), "3", "0", str(fixture)], env=env,
+            capture_output=True, timeout=120)
+        if run.returncode:
+            return False, f"ARM64 installer fixture failed: {run.stdout!r} {run.stderr!r}"
+        for name, data in expected.items():
+            if (blocks / name).read_bytes() != data:
+                return False, f"Installer byte mismatch: {name}"
+    return True, f"{rom_zip.name}: package headers checked; ARM64 installer passed synthetic byte-exact test (not a device boot test)"
 
 
 def append_summary(title: str, results: list[tuple[str, bool, str]]):
@@ -605,6 +629,49 @@ def append_summary(title: str, results: list[tuple[str, bool, str]]):
             f.write(report)
 
 
+
+def check_dtbo(workdir):
+    data = (workdir / "final_firmware/dtbo.img").read_bytes()
+    if len(data) < 32:
+        return False, "Truncated DTBO"
+    magic, total, header, entry_size, count, offset, page, version = struct.unpack_from(">8I", data)
+    if magic != 0xd7b7ab1e or count != 4 or entry_size < 32 or total > len(data):
+        return False, f"Invalid DTBO table or entry count: {count}"
+    for i in range(count):
+        size, start = struct.unpack_from(">II", data, offset+i*entry_size)
+        if start+size > len(data) or data[start:start+4] != b"\xd0\x0d\xfe\xed":
+            return False, f"Invalid FDT entry {i}"
+    return True, "Four valid FDT overlays (hardware matching still needs device test)"
+
+
+def check_layout(workdir):
+    final = workdir / "final"
+    parts = (final / "logical_partitions.txt").read_text().split()
+    if set(parts) != {"system", "system_ext", "product", "vendor"}:
+        return False, f"Unexpected logical partitions: {parts}"
+    for path in ("vendor/default.prop", "vendor/build.prop"):
+        prop = final / path
+        if prop.exists() and read_prop([prop], "ro.zygote") != "zygote64":
+            return False, f"Wrong zygote in {path}"
+    if (final / "product/etc/device_features/kunzite.xml").exists():
+        return False, "Donor device_features survived"
+    if list((final / "vendor/etc/selinux").glob("precompiled_sepolicy*")):
+        return False, "Stale precompiled policy survived"
+    return True, "Four-partition layout, vendor zygote and policy cache checks passed"
+
+
+def check_erofs_features(workdir):
+    report = workdir / "erofs_summaries.txt"
+    if not report.is_file():
+        return False, "Missing EROFS feature report"
+    text = report.read_text()
+    if any(x in text for x in ("big_pcluster", "compr_cfgs", "ztailpacking", "fragments", "dedupe")):
+        return False, "Unexpected EROFS incompatibility feature"
+    if text.count("=== EROFS [") != 4:
+        return False, "Expected four checked EROFS images"
+    return True, "Four EROFS images checked; no large-cluster feature enabled"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workdir", required=True)
@@ -620,12 +687,16 @@ def main():
             ("2. محاكاة تجميع SELinux الحقيقية (`secilc` Split-Policy)", lambda: heal_and_compile_selinux(workdir / "final")),
             ("3. فحص حزمة VNDK ومكتبات العتاد الحرجة (`linker64` / `DT_NEEDED`)", lambda: check_stage3_vndk_and_linker(workdir / "final")),
             ("4. محاكاة تنفيذ بيئة ARM64 (`qemu-aarch64-static` Bionic Test)", lambda: check_stage4_qemu_arm64(workdir / "final")),
+            ("7. DTBO four-entry audit", lambda: check_dtbo(workdir)),
+            ("8. Layout and runtime property audit", lambda: check_layout(workdir)),
             ("5. التحقق من تعطيل قيود AVB / DM-Verity (`vbmeta` + `fstab`)", lambda: check_stage5_avb_vbmeta(workdir)),
         ]:
             ok, msg = fn()
             results.append((label, ok, msg))
         append_summary("تقرير محاكاة الإقلاع المسبق (Pre-Boot Anti-Bootloop Simulation)", results)
     else:
+        erofs_ok, erofs_msg = check_erofs_features(workdir)
+        results.append(("9. EROFS feature audit", erofs_ok, erofs_msg))
         ok, msg = check_stage6_post_repack(workdir)
         results.append(("6. محاكاة سكربت التفليش وحاوية `super.img`", ok, msg))
         append_summary("تقرير محاكاة التفليش النهائي (Flash Package Verification)", results)
