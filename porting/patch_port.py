@@ -145,9 +145,8 @@ def patch_fstab_file(fstab_path: Path, logical_parts: list[str], disable_dfe: bo
                 # سنكتب أسطر البارتيشنات المنطقية الموحدة بالأعلى بصيغة EROFS + EXT4 بدون AVB
                 continue
             # إزالة قيود avb/verity من أي بارتيشن آخر
-            fs_flags = re.sub(r",?avb(?:=[^,\s]+)?", "", fs_flags)
-            fs_flags = re.sub(r",?avb_keys=[^,\s]+", "", fs_flags)
-            fs_flags = re.sub(r",?verify(?:=[^,\s]+)?", "", fs_flags)
+            fs_flags = ",".join(flag for flag in fs_flags.split(",")
+                if flag and flag != "avb" and not flag.startswith(("avb=", "avb_keys=", "verify")))
             if disable_dfe and mnt == "/data":
                 fs_flags = re.sub(r",?fileencryption=[^,\s]+", "", fs_flags)
                 fs_flags = re.sub(r",?metadata_encryption=[^,\s]+", "", fs_flags)
@@ -1673,8 +1672,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--ui-type", default="auto", choices=["auto", "hyperos", "oplus", "nothingos", "aosp"])
-    parser.add_argument("--enable-debloat", default="true")
-    parser.add_argument("--enable-adb-debug", default="true")
+    parser.add_argument("--enable-debloat", default="false")
+    parser.add_argument("--enable-adb-debug", default="false")
     parser.add_argument("--disable-dfe", default="false")
     args = parser.parse_args()
 
@@ -1824,7 +1823,10 @@ def main():
         run_smart_debloat(final_dir)
 
     if args.enable_adb_debug.lower() == "true":
-        install_early_adb(final_dir)
+        try:
+            install_early_adb(final_dir)
+        except Exception as exc:
+            print(f"::warning::Early ADB installation failed; continuing without guaranteed early ADB: {exc}", flush=True)
 
     # 10. Pre-compile & auto-heal SELinux split CIL policies via secilc before sealing fs_config
     if shutil.which("secilc"):

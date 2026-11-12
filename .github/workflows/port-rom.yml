@@ -47,13 +47,21 @@ on:
       enable_debloat:
         description: "حذف التطبيقات الزائدة والإعلانية لتناسب مساحة super (8GB)"
         required: false
-        default: true
+        default: false
         type: boolean
       enable_adb_debug:
         description: "تفعيل USB ADB مبكراً أثناء الإقلاع لتسهيل سحب سجلات logcat"
         required: false
-        default: true
+        default: false
         type: boolean
+      selinux_mode:
+        description: "SELinux boot mode (permissive is for diagnostics only)"
+        required: true
+        default: "enforcing"
+        type: choice
+        options:
+          - enforcing
+          - permissive
       disable_dfe:
         description: "تعطيل تشفير البيانات التلقائي (Disable Force Encryption)"
         required: false
@@ -133,6 +141,7 @@ jobs:
             --input "$PORT_WORKDIR/downloads/base_rom${BASE_EXT}" \
             --role base \
             --workdir "$PORT_WORKDIR"
+          python3 "$GITHUB_WORKSPACE/porting/check_base_bridge.py" --workdir "$PORT_WORKDIR"
           df -h /
 
       - name: تحميل وفك روم الواجهة المراد نقلها (Download & Unpack Port ROM)
@@ -181,18 +190,21 @@ jobs:
           K_MODE: ${{ inputs.kernel_mode }}
           K_URL: ${{ inputs.custom_kernel_url }}
           D_DFE: ${{ inputs.disable_dfe }}
+          SE_MODE: ${{ inputs.selinux_mode }}
         run: |
           "$GITHUB_WORKSPACE/porting/kernel_handler.sh" \
             "$PORT_WORKDIR" \
             "$K_MODE" \
             "$K_URL" \
-            "$D_DFE"
+            "$D_DFE" \
+            "$SE_MODE"
 
       - name: محاكاة الإقلاع المسبق ومنع الـ Bootloop (Pre-Boot Simulation)
         run: |
           python3 "$GITHUB_WORKSPACE/porting/simulate_boot_check.py" \
             --workdir "$PORT_WORKDIR" \
-            --phase pre-repack
+            --phase pre-repack \
+            --kernel-mode "${{ inputs.kernel_mode }}"
 
       - name: ضغط EROFS وتجميع super.img والملف النهائي للتفليش (Repack ROM)
         env:
@@ -243,3 +255,16 @@ jobs:
           echo "=========================================================="
           echo "✅ رابط التحميل المباشر (GoFile): ${DL_URL}"
           echo "=========================================================="
+
+      - name: Preserve Build audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-audit-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ env.PORT_WORKDIR }}/erofs_summaries.txt
+            ${{ env.PORT_WORKDIR }}/super_lpdump.txt
+            ${{ env.PORT_WORKDIR }}/kernel_release.txt
+            ${{ env.PORT_WORKDIR }}/kernel_modules.txt
+            ${{ env.PORT_WORKDIR }}/base_bridge_check.txt

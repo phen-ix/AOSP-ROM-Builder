@@ -5,11 +5,19 @@ WORKDIR="${1:?Missing WORKDIR}"
 KERNEL_MODE="${2:-keep_base}"
 CUSTOM_KERNEL_URL="${3:-}"
 DISABLE_DFE="${4:-false}"
+SELINUX_MODE="${5:-enforcing}"
+case "$SELINUX_MODE" in enforcing|permissive) ;; *) echo "::error::Invalid SELinux mode"; exit 1 ;; esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "$KERNEL_MODE" = "custom_url" ] && [ -z "$CUSTOM_KERNEL_URL" ]; then
+  echo "::error::custom_url requires an explicit kernel URL; refusing keep_base fallback"
+  exit 1
+fi
 
 FW_DIR="${WORKDIR}/base/firmware"
 OUT_FW="${WORKDIR}/final_firmware"
 mkdir -p "$OUT_FW"
+printf '%s\n' "$KERNEL_MODE" > "$WORKDIR/kernel_mode.txt"
+rm -f "$WORKDIR/kernel_release.txt"
 
 # نسخ ملفات الإقلاع المتوفرة من الروم الأساسي
 for img in boot.img dtbo.img vbmeta.img vbmeta_system.img vbmeta_vendor.img; do
@@ -86,6 +94,9 @@ if [ "$KERNEL_MODE" = "custom_url" ] && [ -n "$CUSTOM_KERNEL_URL" ]; then
     if [ -n "$K_IMG" ]; then
       cp -f "$K_IMG" "${BOOT_TMP}/kernel"
       echo "  [KERNEL] تم استبدال النواة من AnyKernel3: $(basename "$K_IMG")"
+    else
+      echo "::error::Custom kernel ZIP has no supported kernel image; refusing Base fallback"
+      exit 1
     fi
     AK_DTB=$(find "${BOOT_TMP}/ak3" -maxdepth 3 -type f \( -name "dtb" -o -name "dtb.img" \) | head -n 1)
     if [ -n "$AK_DTB" ] && [ -f "${BOOT_TMP}/dtb" ]; then
@@ -149,6 +160,11 @@ elif [ "$KERNEL_MODE" = "compile_phenix_new" ]; then
     CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
     CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
     Image.gz dtbs
+  if [ ! -s out/include/config/kernel.release ]; then
+    echo "::error::Missing out/include/config/kernel.release after kernel build"
+    exit 1
+  fi
+  cp out/include/config/kernel.release "$WORKDIR/kernel_release.txt"
 
   if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     cp -f "out/arch/arm64/boot/Image.gz" "${BOOT_TMP}/kernel"
@@ -231,6 +247,11 @@ KCFG
     CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
     CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
     Image.gz dtbs
+  if [ ! -s out/include/config/kernel.release ]; then
+    echo "::error::Missing out/include/config/kernel.release after kernel build"
+    exit 1
+  fi
+  cp out/include/config/kernel.release "$WORKDIR/kernel_release.txt"
 
   if [ -f "out/arch/arm64/boot/Image.gz" ]; then
     cp -f "out/arch/arm64/boot/Image.gz" "${BOOT_TMP}/kernel"
@@ -247,7 +268,22 @@ else
   echo "=== [3/4] الاحتفاظ بنواة الروم الأساسي مع تحديث الـ ramdisk لدعم EROFS ==="
 fi
 
+# For external/base kernels derive release from the actual selected unpacked kernel.
+if [ ! -s "$WORKDIR/kernel_release.txt" ]; then
+  python3 - "$BOOT_TMP/kernel" "$WORKDIR/kernel_release.txt" << 'PYRELEASE'
+import gzip, pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+if raw.startswith(b"\x1f\x8b"):
+    raw = gzip.decompress(raw)
+match = re.search(rb"Linux version ([^\s\x00]+)", raw)
+release = match.group(1).decode("ascii", errors="strict") if match else "UNAVAILABLE"
+pathlib.Path(sys.argv[2]).write_text(release + "\n")
+print("[KERNEL RELEASE] " + release)
+PYRELEASE
+fi
+
 echo "=== [4/4] إعادة تجميع boot.img وتعطيل فحص AVB في vbmeta ==="
+python3 "$SCRIPT_DIR/boot_header.py" "${BOOT_TMP}/header" "$SELINUX_MODE"
 magiskboot repack boot.img new-boot.img
 cp -f new-boot.img "${OUT_FW}/boot.img"
 popd >/dev/null

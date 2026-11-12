@@ -41,3 +41,14 @@ Authenticated GitHub repository lookup using previous session credentials return
 3. Dispatch .github/workflows/port-rom.yml using its Base/Port defaults and compile_phenix_new.
 4. Monitor all stages and repair observed failures, particularly any unsupported donor adbd layout or policy/type errors.
 5. Deliver only the actual resulting ROM link with checksums and an explicit device-test disclaimer.
+
+## Build A correction pass (supersedes earlier blocker/default statements)
+- phase3-fixes.patch was not present among uploaded files. The three textual corrections requested by the user were applied manually over the already-applied Phase 3 changes.
+- fstab flags are filtered as comma-separated tokens; optional early ADB failure becomes a warning; dmsetup only removes named system mappings, without remove_all or force.
+- Debloat and early ADB default to false, including patch_port.py CLI defaults. selinux_mode defaults to enforcing; boot header cmdline is edited before repack.
+- Compiled kernel.release is retained. External/base kernel release is derived from the selected kernel banner when possible. Module vermagic audit records every discovered .ko; mismatch fails compiled modes and warns only for keep_base/custom_url.
+- Base bridge prerequisites are checked immediately after Base unpack, before donor download. The runtime linker must be ELF32 and /system/lib must exist.
+- Audit artifacts are retained using an always() upload-artifact step.
+- Nine local unit tests passed, including synthetic header/module/preflight cases. Static ARM64 installer QEMU integration passed again. Actual donor/Base preflight and repacked boot behavior remain untested.
+- Latest authenticated GET /user and GET /repos/phen-ix/AOSP-ROM-Builder both returned HTTP 200. Earlier HTTP 404 is historical, not the present read-access result.
+- The exact developer Nezuko custom kernel URL for the sole requested Build A is not available in the current context. No substitute kernel or alternative ROM build is authorized. Do not dispatch until the precise package is confirmed.

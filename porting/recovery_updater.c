@@ -295,26 +295,25 @@ static void prepare_dynamic_super_for_write(void) {
         umount2(mnts[i], MNT_DETACH);
     }
 
-    /* Release any recovery dm-linear mappings holding super if dmsetup exists */
+    /* Never remove unrelated mappings: /data may contain the open ROM ZIP. */
     const char *dm_bins[] = {"/system/bin/dmsetup", "/sbin/dmsetup"};
+    const char *names[] = {"system", "system_ext", "product", "vendor", "odm", "mi_ext"};
     for (size_t i = 0; i < sizeof(dm_bins) / sizeof(dm_bins[0]); i++) {
-        if (access(dm_bins[i], X_OK) == 0) {
+        if (access(dm_bins[i], X_OK) != 0) continue;
+        for (size_t j = 0; j < sizeof(names) / sizeof(names[0]); j++) {
             pid_t pid = fork();
             if (pid == 0) {
-                int devnull = open("/dev/null", O_RDWR);
-                if (devnull >= 0) {
-                    dup2(devnull, STDOUT_FILENO);
-                    dup2(devnull, STDERR_FILENO);
-                    close(devnull);
-                }
-                execl(dm_bins[i], "dmsetup", "remove_all", "-f", (char *)NULL);
-                _exit(0);
+                execl(dm_bins[i], "dmsetup", "remove", names[j], (char *)NULL);
+                _exit(127);
             } else if (pid > 0) {
                 int status = 0;
-                waitpid(pid, &status, 0);
+                if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                    ui_print("! Warning: could not remove mapping %s (may be absent or busy)", names[j]);
+            } else {
+                ui_print("! Warning: cannot fork dmsetup for %s", names[j]);
             }
-            break;
         }
+        break;
     }
 }
 

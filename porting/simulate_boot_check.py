@@ -700,16 +700,54 @@ def check_property_types(workdir):
     return True, "Property context syntax, per-file duplicate keys and declared types checked"
 
 
+
+def check_kernel_modules(workdir: Path, kernel_mode: str):
+    release_file = workdir / "kernel_release.txt"
+    release = release_file.read_text().strip() if release_file.is_file() else "UNAVAILABLE"
+    roots = [workdir / "final/vendor/lib/modules", workdir / "final/vendor_dlkm",
+             workdir / "base/vendor_dlkm"]
+    modules = sorted({p for root in roots if root.exists() for p in root.rglob("*.ko") if p.is_file()})
+    lines = [f"kernel_mode={kernel_mode}", f"kernel_release={release}", f"module_count={len(modules)}"]
+    problems = []
+    if release == "UNAVAILABLE" or not release:
+        problems.append("Selected kernel release could not be determined")
+    for module in modules:
+        match = re.search(rb"(?:^|\x00)vermagic=([^\x00]+)", module.read_bytes())
+        vermagic = match.group(1).decode("ascii", errors="replace") if match else "MISSING"
+        lines.append(f"{module.relative_to(workdir)}\tvermagic={vermagic}")
+        print(f"[MODULE] {module}: vermagic={vermagic}; selected kernel={release}", flush=True)
+        if vermagic == "MISSING" or vermagic.split()[0] != release:
+            problems.append(f"{module.relative_to(workdir)}: vermagic={vermagic!r}, kernel_release={release!r}")
+    if not modules:
+        lines.append("No *.ko found in scanned roots (not proof that built-in drivers cover hardware)")
+    lines.extend("PROBLEM: " + problem for problem in problems)
+    (workdir / "kernel_modules.txt").write_text("\n".join(lines) + "\n")
+    print("[MODULE AUDIT] " + "; ".join(lines[:3]), flush=True)
+    if problems:
+        message = "Kernel module release audit: " + "; ".join(problems)
+        if kernel_mode in ("keep_base", "custom_url"):
+            print("::warning::" + message, flush=True)
+            return True, "WARNING (not verified compatible): " + message
+        print("::error::" + message, flush=True)
+        return False, message
+    return True, f"Checked {len(modules)} modules against kernel_release={release}; release match only, not ABI proof"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--phase", required=True, choices=["pre-repack", "post-repack"])
+    parser.add_argument("--kernel-mode", choices=["keep_base", "custom_url", "compile_phenix_new", "compile_nexusbase"])
     args = parser.parse_args()
 
     workdir = Path(args.workdir)
+    mode_file = workdir / "kernel_mode.txt"
+    kernel_mode = args.kernel_mode or (mode_file.read_text().strip() if mode_file.is_file() else "unknown")
     results: list[tuple[str, bool, str]] = []
 
     if args.phase == "pre-repack":
+        module_ok, module_msg = check_kernel_modules(workdir, kernel_mode)
+        results.append(("Kernel module vermagic audit", module_ok, module_msg))
         for label, fn in [
             ("1. محاكاة الإقلاع الأولي والـ Ramdisk (Kernel + DTB + EROFS fstab)", lambda: check_stage1_boot_and_fstab(workdir)),
             ("2. محاكاة تجميع SELinux الحقيقية (`secilc` Split-Policy)", lambda: heal_and_compile_selinux(workdir / "final")),

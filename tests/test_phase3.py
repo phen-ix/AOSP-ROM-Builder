@@ -8,6 +8,15 @@ patch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(patch)
 
 class Phase3Tests(unittest.TestCase):
+    def test_fstab_avb_keys_verifyatboot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fstab = Path(tmp) / 'fstab.default'
+            fstab.write_text('/dev/block/userdata /data ext4 noatime wait,avb_keys=/avb/q-gsi.avbpubkey,verifyatboot,avb=vbmeta,verify=/dev/block/verity,avb,quota,fileencryption=aes-256-xts\n')
+            patch.patch_fstab_file(fstab, ['system', 'vendor'], False)
+            data_line = next(line for line in fstab.read_text().splitlines() if '/data' in line)
+            self.assertEqual(data_line.split()[4], 'wait,quota,fileencryption=aes-256-xts')
+            self.assertNotIn('_keys=', fstab.read_text())
+
     def test_literal_context_escape(self):
         import re
         for name in ['a+b.apk', 'file[1](x).xml', 'a-b c#d', 'foo\\bar']:
