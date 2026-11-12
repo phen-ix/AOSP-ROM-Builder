@@ -271,7 +271,8 @@ static int find_block_device(const char *part, char *out_path, size_t out_sz) {
     };
     const char *suffixes[] = {"", "_a"};
 
-    for (size_t b = 0; b < sizeof(bases) / sizeof(bases[0]); b++) {
+    size_t base_count = override_dir ? 1 : sizeof(bases) / sizeof(bases[0]);
+    for (size_t b = 0; b < base_count; b++) {
         if (!bases[b] || !bases[b][0]) continue;
         for (size_t s = 0; s < sizeof(suffixes) / sizeof(suffixes[0]); s++) {
             snprintf(out_path, out_sz, "%s/%s%s", bases[b], part, suffixes[s]);

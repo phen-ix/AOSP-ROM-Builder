@@ -672,6 +672,34 @@ def check_erofs_features(workdir):
     return True, "Four EROFS images checked; no large-cluster feature enabled"
 
 
+
+def check_property_types(workdir):
+    final = workdir / "final"
+    types = set()
+    for part in ("system", "system_ext", "product", "vendor", "odm"):
+        for cil in (final / part).rglob("*.cil"):
+            types.update(re.findall(r"\(type\s+([^\s()]+)\s*\)", cil.read_text(errors="replace")))
+    missing = set()
+    for part in ("system", "system_ext", "product", "vendor", "odm"):
+        for ctx in (final / part).rglob("*property_contexts"):
+            seen = set()
+            for line in ctx.read_text(errors="replace").splitlines():
+                bits = line.split()
+                if not bits or bits[0].startswith("#"):
+                    continue
+                if len(bits) < 2:
+                    return False, f"Malformed property context: {ctx}: {line}"
+                if bits[0] in seen:
+                    return False, f"Duplicate property key in {ctx}: {bits[0]}"
+                seen.add(bits[0])
+                fields = bits[1].split(":")
+                if len(fields) < 3 or fields[2] not in types:
+                    missing.add(bits[1])
+    if missing:
+        return False, f"Property types absent from split CIL declarations: {sorted(missing)}"
+    return True, "Property context syntax, per-file duplicate keys and declared types checked"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--workdir", required=True)
@@ -687,6 +715,7 @@ def main():
             ("2. محاكاة تجميع SELinux الحقيقية (`secilc` Split-Policy)", lambda: heal_and_compile_selinux(workdir / "final")),
             ("3. فحص حزمة VNDK ومكتبات العتاد الحرجة (`linker64` / `DT_NEEDED`)", lambda: check_stage3_vndk_and_linker(workdir / "final")),
             ("4. محاكاة تنفيذ بيئة ARM64 (`qemu-aarch64-static` Bionic Test)", lambda: check_stage4_qemu_arm64(workdir / "final")),
+            ("10. Property context type audit", lambda: check_property_types(workdir)),
             ("7. DTBO four-entry audit", lambda: check_dtbo(workdir)),
             ("8. Layout and runtime property audit", lambda: check_layout(workdir)),
             ("5. التحقق من تعطيل قيود AVB / DM-Verity (`vbmeta` + `fstab`)", lambda: check_stage5_avb_vbmeta(workdir)),
