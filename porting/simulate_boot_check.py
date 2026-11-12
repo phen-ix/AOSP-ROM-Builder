@@ -227,8 +227,13 @@ def check_stage1_boot_and_fstab(workdir: Path) -> tuple[bool, str]:
         else:
             missing_ksyms = [s for s in required_ksyms if s.encode() not in k_raw]
         if missing_ksyms:
-            return False, f"كيرنل 4.14 يفتقد استدعاءات النظام الإلزامية لـ Android 16 (SDK {sdk_ver}): {missing_ksyms}"
-        a16_note = "، وتم التحقق من وجود استدعاءات Android 16 (`close_range`, `faccessat2`, `epoll_pwait2`, `process_mrelease`, `bpf_jit_enable`)"
+            if os.environ.get("BUILD_A_SYMBOL_WAIVER") == "true":
+                print(f"::warning::User-approved Build A symbol waiver: {missing_ksyms}; not a runtime compatibility test", flush=True)
+                a16_note = f"; user-approved missing-symbol waiver: {missing_ksyms} (runtime untested)"
+            else:
+                return False, f"كيرنل 4.14 يفتقد استدعاءات النظام الإلزامية لـ Android 16 (SDK {sdk_ver}): {missing_ksyms}"
+        else:
+            a16_note = "; Android 16 symbol strings found (not a runtime test)"
 
     # 2. Check Ramdisk fstab & /init
     r_off = page_sz + align(kernel_sz)

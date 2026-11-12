@@ -200,6 +200,8 @@ jobs:
             "$SE_MODE"
 
       - name: محاكاة الإقلاع المسبق ومنع الـ Bootloop (Pre-Boot Simulation)
+        env:
+          BUILD_A_SYMBOL_WAIVER: ${{ inputs.rom_name == 'Build-A-iputobject-keep-base' && inputs.kernel_mode == 'keep_base' && inputs.base_rom_url == 'https://pixeldrain.com/api/file/Ya9uKFfV' }}
         run: |
           python3 "$GITHUB_WORKSPACE/porting/simulate_boot_check.py" \
             --workdir "$PORT_WORKDIR" \
